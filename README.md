@@ -18,7 +18,7 @@ This is all currently a WIP, but does include some basic functionality.
 
 
 
-Once you flash the file to your SharkShit64 cart you will want to set up your WiFi credentials by getting on a WiFi capable device (PC, or phone, for example) and connecting to the SSID "SharkShit64" and in your webbrowser on the connected device you'll want to go to http://192.168.4.1 at which point you should be greeted with an SSID and PASS field that you use to fill in your internet connected router WiFi credentials.
+Once you flash the file to your SharkShit64 cart you will want to set up your WiFi credentials by getting on a WiFi capable device (PC, or phone, for example) and connecting to the SSID "SharkShit64" and in your web browser on the connected device you'll want to go to http://192.168.4.1 at which point you should be greeted with an SSID and PASS field that you use to fill in your internet connected router WiFi credentials.
 
 
 
