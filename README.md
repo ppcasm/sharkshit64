@@ -42,13 +42,11 @@ You'll then be asked to select a username and password, and once you do that and
 
 \### Credits
 
-&nbsp;\[@Modman](https://github.com/RWeick/)
+\[@Modman](https://github.com/RWeick/)  
 
-&nbsp;\[@Jhynjhiruu](https://github.com/Jhynjhiruu/)
+\[@Jhynjhiruu](https://github.com/Jhynjhiruu/)  
 
-&nbsp;\[@ppcasm](https://github.com/ppcasm/)
-
-
+\[@ppcasm](https://github.com/ppcasm/)
 
 
 
