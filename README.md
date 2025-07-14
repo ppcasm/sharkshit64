@@ -1,4 +1,4 @@
-\# SharkShit64 Firmware (for ESP32 based clone)
+# SharkShit64 Firmware (for ESP32 based clone)
 
 
 
@@ -10,7 +10,7 @@ This is the firmware used to work together with Rick Weiss's SharkShit64 open so
 
 
 
-\### Usage
+### Usage
 
 
 
@@ -34,19 +34,19 @@ You'll then be asked to select a username and password, and once you do that and
 
 
 
-\### Building
+### Building
 
 (Will be posted at a later time)
 
 
 
-\### Credits
+### Credits
 
-\[@Modman](https://github.com/RWeick/)  
+[@Modman](https://github.com/RWeick/)  
 
-\[@Jhynjhiruu](https://github.com/Jhynjhiruu/)  
+[@Jhynjhiruu](https://github.com/Jhynjhiruu/)  
 
-\[@ppcasm](https://github.com/ppcasm/)
+[@ppcasm](https://github.com/ppcasm/)
 
 
 
