@@ -2,7 +2,7 @@
 
 
 
-This is the firmware used to work together with Rick Weiss's SharkShit64 open source ESP32 based Interact Sharkwire Online clone.
+This is the firmware used to work together with Richard Weick's SharkShit64 open source ESP32 based Interact Sharkwire Online clone.
 
 
 
@@ -42,11 +42,9 @@ You'll then be asked to select a username and password, and once you do that and
 
 ### Credits
 
-[@Modman](https://github.com/RWeick/)  
+[@Modman](https://github.com/RWeick/)
 
-[@Jhynjhiruu](https://github.com/Jhynjhiruu/)  
+[@Jhynjhiruu](https://github.com/Jhynjhiruu/)
 
 [@ppcasm](https://github.com/ppcasm/)
-
-
 
