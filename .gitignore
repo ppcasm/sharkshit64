@@ -1,6 +1,34 @@
-# Ignore build artifacts
-build/
+# Build output
+/build/
 *.bin
 *.elf
 *.map
+
+# IDF configurations
+sdkconfig
 sdkconfig.old
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# VSCode and CLion
+.vscode/
+.idea/
+
+# Python virtual envs
+venv/
+.env/
+__pycache__/
+
+# ESP-IDF Tools
+*.pyc
+*.pyo
+
+# Auto-generated metadata
+.project
+.cproject
+.settings/
