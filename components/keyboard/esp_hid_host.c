@@ -182,6 +182,27 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
 
 void ble_task(void *args)
 {
+    // Step 1: Check for bonded devices
+    int dev_num = esp_ble_get_bond_device_num();
+    if (dev_num > 0) {
+        esp_ble_bond_dev_t bonded_dev_list[dev_num];
+        if (esp_ble_get_bond_device_list(&dev_num, bonded_dev_list) == ESP_OK) {
+            ESP_LOGI(BLE_HOST_TAG, "Found %d bonded device(s)", dev_num);
+
+            esp_bd_addr_t *bda = &bonded_dev_list[0].bd_addr; // Only one supported
+
+            ESP_LOGI(BLE_HOST_TAG, "Trying to connect to bonded device: " ESP_BD_ADDR_STR,
+                     ESP_BD_ADDR_HEX(*bda));
+
+            // Attempt to open it (use BLE public address type)
+            esp_hidh_dev_open(*bda, ESP_HID_TRANSPORT_BLE, BLE_ADDR_TYPE_PUBLIC);
+
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    // Step 2: Fall back to scan if no bonded devices
     while (!connected) {
         size_t results_len = 0;
         esp_hid_scan_result_t *results = NULL;
@@ -208,10 +229,10 @@ void ble_task(void *args)
             }
 
             if (cr) {
-                ESP_LOGI(BLE_HOST_TAG, "Trying to open device...");
+                ESP_LOGI(BLE_HOST_TAG, "Trying to open scanned device...");
                 esp_hidh_dev_open(cr->bda, cr->transport, cr->ble.addr_type);
                 esp_hid_scan_results_free(results);
-                break; // Exit loop and wait for connection
+                break;
             }
 
             esp_hid_scan_results_free(results);
