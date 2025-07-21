@@ -22,11 +22,17 @@
 #include "esp_hidh.h"
 #include "esp_hid_gap.h"
 
+#include "esp_hid_host.h"
 #include "gpio_keyboard.h"
 
 static const char *BLE_HOST_TAG = "BLE_HOST";
 
-static bool connected = false;
+static bool bda_valid = false;
+static bool ble_connected = false;
+static esp_bd_addr_t last_bonded_bda = {0};
+char current_ble_manufacturer[64] = "Unknown";
+
+static int ble_battery_level = -1;
 
 static const uint8_t hid_to_scancode[128] = {
     // Lowercase letters (HID 0x04–0x1D)
@@ -122,6 +128,51 @@ void handle_input(const uint8_t *data, size_t len) {
     memcpy(last_keys, keys, MAX_KEYS);
 }
 
+int get_ble_battery_level(void) {
+    return ble_battery_level;
+}
+
+bool get_bonded_device_address(esp_bd_addr_t out_bda) {
+    if (!bda_valid) return false;
+    memcpy(out_bda, last_bonded_bda, sizeof(esp_bd_addr_t));
+    return true;
+}
+
+bool is_ble_connected(void) {
+    return ble_connected;
+}
+
+void ble_set_manufacturer(const char *value) {
+    strncpy(current_ble_manufacturer,
+            value ? value : "Unknown",
+            sizeof(current_ble_manufacturer) - 1);
+    current_ble_manufacturer[sizeof(current_ble_manufacturer) - 1] = '\0';
+}
+
+const char *get_ble_manufacturer(void) {
+    return current_ble_manufacturer;
+}
+
+bool unbond_ble_device(void) {
+    esp_bd_addr_t bda;
+    int dev_num = esp_ble_get_bond_device_num();
+
+    esp_ble_bond_dev_t bonded_dev_list[dev_num];
+    
+    if (esp_ble_get_bond_device_list(&dev_num, bonded_dev_list) == ESP_OK && dev_num > 0) {
+        memcpy(bda, bonded_dev_list[0].bd_addr, sizeof(esp_bd_addr_t));
+        esp_err_t err = esp_ble_remove_bond_device(bda);
+        if (err == ESP_OK) {
+            ESP_LOGI(BLE_HOST_TAG, "Unbonded BLE device: %02X:%02X:%02X:%02X:%02X:%02X",
+                     bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+            return true;
+        } else {
+            ESP_LOGI(BLE_HOST_TAG, "Failed to remove bonded device: %s", esp_err_to_name(err));
+        }
+    }
+    return false;
+}
+
 void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
     esp_hidh_event_t event = (esp_hidh_event_t)id;
@@ -131,15 +182,19 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
 
     case ESP_HIDH_OPEN_EVENT: {
         if (param->open.status == ESP_OK) {
-            connected = true;
+            ble_connected = true;
 
             // When connected, set GPIO up
             init_gpio_keyboard();
 
+            esp_hidh_dev_t *dev = param->open.dev;
+            ble_set_manufacturer(esp_hidh_dev_manufacturer_get(dev));
+
             ESP_LOGI(BLE_HOST_TAG, "Device connected.");
-        } else {
-            ESP_LOGE(BLE_HOST_TAG, "Failed to open device.");
-            connected = false;
+        } else {  
+            ESP_LOGI(BLE_HOST_TAG, "Failed to open device (status: 0x%02x)", param->open.status);  
+            ble_connected = false;
+            vTaskDelay(pdMS_TO_TICKS(5000));
             xTaskCreate(&ble_task, "ble_scan_retry", 8192, NULL, 5, NULL);
         }
         break;
@@ -150,6 +205,8 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
         if (bda) {
             ESP_LOGI(BLE_HOST_TAG, ESP_BD_ADDR_STR " BATTERY: %d%%", ESP_BD_ADDR_HEX(bda),
             param->battery.level);
+
+            ble_battery_level = param->battery.level;
         }
         break;
     }
@@ -170,7 +227,7 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
 
     case ESP_HIDH_CLOSE_EVENT: {
         ESP_LOGI(BLE_HOST_TAG, "Device disconnected.");
-        connected = false;
+        ble_connected = false;
         xTaskCreate(&ble_task, "ble_scan_retry", 8192, NULL, 5, NULL);
         break;
     }
@@ -187,15 +244,27 @@ void ble_task(void *args)
     if (dev_num > 0) {
         esp_ble_bond_dev_t bonded_dev_list[dev_num];
         if (esp_ble_get_bond_device_list(&dev_num, bonded_dev_list) == ESP_OK) {
-            ESP_LOGI(BLE_HOST_TAG, "Found %d bonded device(s)", dev_num);
+            esp_bd_addr_t *bda = &bonded_dev_list[0].bd_addr;
 
-            esp_bd_addr_t *bda = &bonded_dev_list[0].bd_addr; // Only one supported for now
+            memcpy(last_bonded_bda, bonded_dev_list[0].bd_addr, sizeof(esp_bd_addr_t));
+            bda_valid = true;
 
-            ESP_LOGI(BLE_HOST_TAG, "Trying to connect to bonded device: " ESP_BD_ADDR_STR,
-                     ESP_BD_ADDR_HEX(*bda));
+            while (!ble_connected) {
+                ESP_LOGI(BLE_HOST_TAG, "Trying to connect to bonded device: " ESP_BD_ADDR_STR,
+                ESP_BD_ADDR_HEX(*bda));
 
-            // Attempt to open it (use BLE public address type)
-            esp_hidh_dev_open(*bda, ESP_HID_TRANSPORT_BLE, BLE_ADDR_TYPE_PUBLIC);
+                esp_hidh_dev_open(*bda, ESP_HID_TRANSPORT_BLE, BLE_ADDR_TYPE_PUBLIC);
+
+                // Wait for open result (success sets 'ble_connected' in hidh_callback)
+                for (int i = 0; i < 20 && !ble_connected; ++i) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+
+                if (!ble_connected) {
+                    ESP_LOGI(BLE_HOST_TAG, "Bonded connection failed. Retrying in 1s...");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                }
+            }
 
             vTaskDelete(NULL);
             return;
@@ -203,7 +272,7 @@ void ble_task(void *args)
     }
 
     // Fall back to scan if no bonded devices
-    while (!connected) {
+    while (!ble_connected) {
         size_t results_len = 0;
         esp_hid_scan_result_t *results = NULL;
 

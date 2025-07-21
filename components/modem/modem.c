@@ -263,7 +263,7 @@ void modem_task(void *arg) {
     esp_wifi_start();
     esp_wifi_connect();
 
-    xTaskCreate(dns_task, "dns_task", 4096, NULL, 8, NULL);
+    xTaskCreate(dns_task, "dns_task", 8192, NULL, 8, NULL);
     xTaskCreate(http_ui_task, "http_ui_task", 8192, NULL, 8, NULL);
 
     // Enable NAT

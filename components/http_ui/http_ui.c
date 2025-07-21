@@ -3,6 +3,7 @@
 #include "esp_wifi_types.h"
 #include "esp_http_server.h"
 
+#include "esp_hid_host.h"
 #include "http_ui.h"
 #include "modem.h"
 
@@ -109,83 +110,244 @@ bool load_sta_credentials(wifi_config_t *sta_config) {
 }
 
 // config_post_handler
-// This handles the POST action of our config WiFi credentials setup page that displays at 192.168.4.1
+// This handles the POST action of the config WiFi credentials setup page that displays at 192.168.4.1
 // when you connect to the ESP32 SSID while its AP is running
 esp_err_t config_post_handler(httpd_req_t *req) {
-    char buf[128];
-    int len = httpd_req_recv(req, buf, sizeof(buf)-1);
-    if (len <= 0) return ESP_FAIL;
-    buf[len] = 0;
 
-    char ssid[32]={0}, pass[64]={0};
-    sscanf(buf, "ssid=%31[^&]&pass=%63s", ssid, pass);
-    save_sta_credentials(ssid, pass);
+    if ((req->method == HTTP_POST) && strcmp(req->uri, "/unbond_ble_device") == 0) {
+        unbond_ble_device();
+        httpd_resp_send(req,
+        "<html><body style=\"background-color:black;\">"
+        "<center><strong><h3><p style=\"color:red;\">"
+        "Power cycle the Nintendo64 to finalize BLE device unbonding"
+        "</p></h3></strong></center>"
+        "</body></html>",
+        HTTPD_RESP_USE_STRLEN);
+   } else {
+        char buf[128];
+        int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+        if (len <= 0) return ESP_FAIL;
+        buf[len] = 0;
 
-    httpd_resp_send(req, "<html><body>Saved. Rebooting...</body></html>", HTTPD_RESP_USE_STRLEN);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    esp_restart();
+        char ssid[32] = {0}, pass[64] = {0};
+        sscanf(buf, "ssid=%31[^&]&pass=%63s", ssid, pass);
+        save_sta_credentials(ssid, pass);
+
+        httpd_resp_send(req,
+        "<html><body style=\"background-color:black; color:white;\">"
+        "<center><strong><h3><p style=\"color:red;\">"
+        "Power cycle the Nintendo64 to finalize WiFi configuration"
+        "</p></h3></strong></center>"
+        "</body></html>",
+        HTTPD_RESP_USE_STRLEN);
+    }
+    //vTaskDelay(pdMS_TO_TICKS(1000));
+    //esp_restart();
+    return ESP_OK;
+}
+
+// ble_status_get_handler
+// This is used to get the ble status so that it can be updated at an interval without having to
+// refresh the entire config page 
+static esp_err_t ble_status_get_handler(httpd_req_t *req) {
+
+    char *ble_section = malloc(4096);
+    if (!ble_section) {
+        free(ble_section);
+        ESP_LOGE("CONFIG", "Memory allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    char bda_str[64] = "N/A";
+    esp_bd_addr_t bda;
+
+    if (get_bonded_device_address(bda)) {
+        snprintf(bda_str, sizeof(bda_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+    }
+
+    bool connected = is_ble_connected();
+    int battery = get_ble_battery_level();
+    char battery_str[16] = "N/A";
+    if (connected && battery >= 0) {
+        if (battery > 100) battery = 100;
+        snprintf(battery_str, sizeof(battery_str), "%d%%", battery);
+    }
+
+    char restart_n64_msg[128] = "";
+    if (strcmp(bda_str, "N/A") == 0 && connected) {
+        snprintf(restart_n64_msg, sizeof(restart_n64_msg),
+            "<strong><p style=\"color:red;\">Power cycle the Nintendo64 to finalize BLE bonding</p></strong>");
+    }
+
+    snprintf(ble_section, 512,
+        "<center><h3>BLE Status</h3></center>"
+        "<p>Bonded Device: %s</p>"
+        "<p>Connected: %s</p>"
+        "<p>Manufacturer: %s</p>"
+        "<p>Battery: %s</p>"
+        "%s"
+        "<form method=\"POST\" action=\"/unbond_ble_device\">"
+        "<input type=\"submit\" value=\"Unbond BLE Device\">"
+        "</form>",
+        bda_str,
+        connected ? "Yes" : "No",
+        get_ble_manufacturer(),
+        battery_str,
+        restart_n64_msg
+    );
+
+    httpd_resp_send(req, ble_section, HTTPD_RESP_USE_STRLEN);
+    free(ble_section);
+
     return ESP_OK;
 }
 
 // config_get_handler
-// This handles the GET request of our config WiFi credentials setup page that displays at 192.168.4.1
-// when you connect to the ESP32 SSID while its AP is running
+// This handles the GET request of the config WiFi credentials setup page that displays at 192.168.4.1
+// when you connect to the ESP32 SSID while its AP is running, and it also shows the current bonded
+// BLE device information (we only support 1 for now)
 esp_err_t config_get_handler(httpd_req_t *req) {
     wifi_config_t sta_config = {0};
-    char html[1024];
 
-    if (load_sta_credentials(&sta_config)) {
-        snprintf(html, sizeof(html),
-            "<html>"
-            "<head>"
-            "<style>"
+    char *html = malloc(4096);
+    if (!html) {
+        free(html);
+        ESP_LOGE("CONFIG", "Memory allocation failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool has_sta = load_sta_credentials(&sta_config);
+
+    // Ensure null termination on NVS string
+    sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = 0;
+    sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = 0;
+
+char *ble_section = malloc(512);
+if (!ble_section) {
+    free(html);
+    ESP_LOGE("CONFIG", "Memory allocation failed");
+    return ESP_ERR_NO_MEM;
+}
+
+char bda_str[64] = "N/A";
+esp_bd_addr_t bda;
+
+if (get_bonded_device_address(bda)) {
+    snprintf(bda_str, sizeof(bda_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+             bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+}
+
+bool connected = is_ble_connected();
+int battery = get_ble_battery_level();
+char battery_str[16] = "N/A";
+if (connected && battery >= 0) {
+    if (battery > 100) battery = 100;
+    snprintf(battery_str, sizeof(battery_str), "%d%%", battery);
+}
+
+char restart_n64_msg[128] = "";
+if (strcmp(bda_str, "N/A") == 0 && connected) {
+    snprintf(restart_n64_msg, sizeof(restart_n64_msg),
+        "<strong><p style=\"color:red;\">Power cycle the Nintendo64 to finalize BLE bonding</p></strong>");
+}
+
+snprintf(ble_section, 512,
+    "<center><h3>BLE Status</h3></center>"
+    "<p>Bonded Device: %s</p>"
+    "<p>Connected: %s</p>"
+    "<p>Manufacturer: %s</p>"
+    "<p>Battery: %s</p>"
+    "%s"
+    "<form method=\"POST\" action=\"/unbond_ble_device\">"
+        "<input type=\"submit\" value=\"Unbond BLE Device\">"
+        "</form>",
+        bda_str,
+        connected ? "Yes" : "No",
+        get_ble_manufacturer(),
+        battery_str,
+        restart_n64_msg
+    );
+
+    int html_len;
+    if (has_sta) {
+        html_len = snprintf(html, 4096,
+            "<html><head><style>"
             "body { background:white; color:black; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; }"
-            ".container { width:auto; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
+            ".container { width: 400px; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
             "input[type=text], input[type=password] { width:100%%; padding:8px; margin:6px 0; box-sizing:border-box; }"
             "input[type=submit] { width:100%%; padding:10px; background:#007acc; color:white; border:none; border-radius:4px; cursor:pointer; }"
             "input[type=submit]:hover { background:#005f99; }"
-            "</style>"
-            "</head>"
-            "<body>"
-            "<div class='container'>"
-            "<center><h2>SharkShit64</h2></center>"
+            "</style></head><body><div class='container'>"
+            "<center><h1><strong>SharkShit64</strong></h1></center>"
+            "<center><h3>Wi-Fi Settings</h3></center>"
             "<form method='POST'>"
             "SSID:<input type='text' name='ssid' value='%s'><br>"
-            "PASS:<input type='password' name='pass' value='%s'><br>"
-            "<input type='submit' value='Save'>"
-            "</form>"
+            "Password:<input type='password' name='pass' value='%s'><br>"
+            "<input type='submit' value='Save WiFi Credentials'></form>"
+            "<div id='ble-status'>%s</div>"
             "</div>"
-            "</body>"
-            "</html>",
-            sta_config.sta.ssid, sta_config.sta.password
+            "<script>"
+            "function updateBLE() {"
+            "  var xhr = new XMLHttpRequest();"
+            "  xhr.onreadystatechange = function() {"
+            "    if (xhr.readyState == 4 && xhr.status == 200) {"
+            "      document.getElementById('ble-status').innerHTML = xhr.responseText;"
+            "    }"
+            "  };"
+            "  xhr.open('GET', '/ble_status', true);"
+            "  xhr.send();"
+            "}"
+            "setInterval(updateBLE, 5000);"
+            "</script>"
+            "</body></html>",
+            (char *)sta_config.sta.ssid,
+            (char *)sta_config.sta.password,
+            ble_section
         );
     } else {
-        snprintf(html, sizeof(html),
-            "<html>"
-            "<head>"
-            "<style>"
+        html_len = snprintf(html, 4096,
+            "<html><head><style>"
             "body { background:white; color:black; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; }"
-            ".container { width:auto; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
+            ".container { width: 400px; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
             "input[type=text], input[type=password] { width:100%%; padding:8px; margin:6px 0; box-sizing:border-box; }"
             "input[type=submit] { width:100%%; padding:10px; background:#007acc; color:white; border:none; border-radius:4px; cursor:pointer; }"
             "input[type=submit]:hover { background:#005f99; }"
-            "</style>"
-            "</head>"
-            "<body>"
-            "<div class='container'>"
-            "<center><h2>SharkShit64</h2></center>"
+            "</style></head><body><div class='container'>"
+            "<center><h1><strong>SharkShit64</strong></h1></center>"
+            "<center><h3>Wi-Fi Settings</h3></center>"
             "<form method='POST'>"
             "SSID:<input type='text' name='ssid'><br>"
-            "PASS:<input type='password' name='pass'><br>"
-            "<input type='submit' value='Save'>"
-            "</form>"
+            "Password:<input type='password' name='pass'><br>"
+            "<input type='submit' value='Save Wifi Credentials'></form>"
+            "<div id='ble-status'>%s</div>"
             "</div>"
-            "</body>"
-            "</html>"
+            "<script>"
+            "function updateBLE() {"
+            "  var xhr = new XMLHttpRequest();"
+            "  xhr.onreadystatechange = function() {"
+            "    if (xhr.readyState == 4 && xhr.status == 200) {"
+            "      document.getElementById('ble-status').innerHTML = xhr.responseText;"
+            "    }"
+            "  };"
+            "  xhr.open('GET', '/ble_status', true);"
+            "  xhr.send();"
+            "}"
+            "setInterval(updateBLE, 5000);"
+            "</script>"
+            "</body></html>",
+            ble_section
         );
     }
 
+    if (html_len >= 4096) {
+        ESP_LOGW("CONFIG", "HTML output truncated (%d bytes)", html_len);
+    }
+
     httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+
+    free(html);
+    free(ble_section);
     return ESP_OK;
 }
 
@@ -500,11 +662,16 @@ void http_ui_task(void *arg) {
     ESP_LOGI(HTTP_UI_TAG, "http_ui started on core %d", xPortGetCoreID());
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.max_uri_handlers = 10;
+
     httpd_handle_t server = NULL;
     httpd_start(&server, &config);
 
     httpd_uri_t config_get_uri = {.uri="/", .method=HTTP_GET, .handler=config_get_handler};
     httpd_uri_t config_post_uri = {.uri="/", .method=HTTP_POST, .handler=config_post_handler};
+
+    // We will handle this in the config_post_handler since it's part of the config page
+    httpd_uri_t unbond_ble_device_post_uri = {.uri="/unbond_ble_device", .method=HTTP_POST, .handler=config_post_handler};
     httpd_uri_t home_get_uri = {.uri="/swo/shark.home", .method=HTTP_GET, .handler=home_get_handler};
 
     // Send Sharkwire act1 GET request to single activation handler
@@ -535,22 +702,56 @@ void http_ui_task(void *arg) {
         .handler = activation_handler,
     };
 
-    // Send Sharkwire newuserform POST request to single activation handler
+    // Send Sharkwire newuserform POST request to newuserform handler
     httpd_uri_t newuserform_post_uri = {
         .uri = "/cgi-bin/netshark/newuserform",
         .method = HTTP_POST,
         .handler = newuserform_handler,
     };
 
+    httpd_uri_t ble_status_uri = {
+        .uri = "/ble_status",
+        .method = HTTP_GET,
+        .handler = ble_status_get_handler,
+    };
+
+    httpd_register_uri_handler(server, &ble_status_uri);
     // Register URI handlers
-    httpd_register_uri_handler(server, &config_get_uri);
-    httpd_register_uri_handler(server, &config_post_uri);
-    httpd_register_uri_handler(server, &home_get_uri);
-    httpd_register_uri_handler(server, &activation1_get_uri);
-    httpd_register_uri_handler(server, &activation1_post_uri);
-    httpd_register_uri_handler(server, &activation2_get_uri);
-    httpd_register_uri_handler(server, &activation2_post_uri);
-    httpd_register_uri_handler(server, &newuserform_post_uri);
+    if (httpd_register_uri_handler(server, &config_get_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register config page GET handler");
+    }
+
+    if (httpd_register_uri_handler(server, &config_post_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register config page POST handler");
+    }
+
+    if (httpd_register_uri_handler(server, &unbond_ble_device_post_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register unbond_ble_device page POST handler");
+    }
+
+    if (httpd_register_uri_handler(server, &home_get_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register /swo/shark.home GET handler");
+    }
+
+    if (httpd_register_uri_handler(server, &activation1_get_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register /cgi-bin/netshark/act_1 GET handler");
+    }
+
+    if (httpd_register_uri_handler(server, &activation1_post_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register /cgi-bin/netshark/act_1 POST handler");
+    }
+
+    if (httpd_register_uri_handler(server, &activation2_get_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register /cgi-bin/netshark/act_2 GET handler");
+    }
+
+    if (httpd_register_uri_handler(server, &activation2_post_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register /cgi-bin/netshark/act_2 POST handler");
+    }
+
+    if (httpd_register_uri_handler(server, &newuserform_post_uri) != ESP_OK) {
+        ESP_LOGE(HTTP_UI_TAG, "Failed to register /cgi-bin/netshark/newuserform POST handler");
+    }
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(50));
