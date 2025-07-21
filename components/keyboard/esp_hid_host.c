@@ -27,6 +27,10 @@
 
 static const char *BLE_HOST_TAG = "BLE_HOST";
 
+static uint8_t last_keys[MAX_KEYS] = {0};
+static uint8_t held_ticks[256] = {0};
+static TaskHandle_t keyboard_repeat_task_handle = NULL;
+
 static bool bda_valid = false;
 static bool ble_connected = false;
 static esp_bd_addr_t last_bonded_bda = {0};
@@ -101,31 +105,55 @@ char *bda2str(uint8_t *bda, char *str, size_t size)
     return str;
 }
 
-uint8_t last_keys[MAX_KEYS] = {0};
+void keyboard_tick() {
+    bool still_held[256] = {0};
+
+    // Track which keys are still held
+    for (int i = 0; i < MAX_KEYS; ++i) {
+        uint8_t key = last_keys[i];
+        if (key == 0) continue;
+        still_held[key] = true;
+
+        if (held_ticks[key] == 0) {
+            // Handle first press
+            queue_scancode(hid_to_scancode[key]);
+        } else if (held_ticks[key] >= REPEAT_DELAY_TICKS &&
+                   (held_ticks[key] - REPEAT_DELAY_TICKS) % REPEAT_INTERVAL_TICKS == 0) {
+            // Handle repeating
+            queue_scancode(hid_to_scancode[key]);
+        }
+
+        held_ticks[key]++;
+    }
+
+    // Reset tick counter for keys no longer held
+    for (int i = 0; i < 256; ++i) {
+        if (!still_held[i]) {
+            held_ticks[i] = 0;
+        }
+    }
+}
+
 
 void handle_input(const uint8_t *data, size_t len) {
-    const uint8_t *keys = &data[2]; // skip modifier + reserved
+    int sc_offset = 2;
+    if (len < 8) sc_offset = 1;
+    const uint8_t *keys = &data[sc_offset];
 
-    // For each new keycode, see if it's not in the previous state
+    memset(last_keys, 0, MAX_KEYS);
+
     for (int i = 0; i < MAX_KEYS; ++i) {
         uint8_t key = keys[i];
         if (key == 0) continue;
-
-        bool is_new = true;
-        for (int j = 0; j < MAX_KEYS; ++j) {
-            if (key == last_keys[j]) {
-                is_new = false;
-                break;
-            }
-        }
-
-        if (is_new) {
-            queue_scancode(hid_to_scancode[key]);
-        }
+        last_keys[i] = key;
     }
+}
 
-    // Update last_keys
-    memcpy(last_keys, keys, MAX_KEYS);
+void keyboard_repeat_task(void *arg) {
+    while (1) {
+        keyboard_tick();
+        vTaskDelay(pdMS_TO_TICKS(KB_TICK_RATE));
+    }
 }
 
 int get_ble_battery_level(void) {
@@ -187,12 +215,22 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
             // When connected, set GPIO up
             init_gpio_keyboard();
 
+            if (keyboard_repeat_task_handle == NULL) {
+            xTaskCreate(keyboard_repeat_task, "kbd_repeat", 2048, NULL, 5, &keyboard_repeat_task_handle);
+            }
+
             esp_hidh_dev_t *dev = param->open.dev;
             ble_set_manufacturer(esp_hidh_dev_manufacturer_get(dev));
 
             ESP_LOGI(BLE_HOST_TAG, "Device connected.");
         } else {  
             ESP_LOGI(BLE_HOST_TAG, "Failed to open device (status: 0x%02x)", param->open.status);  
+
+            if (keyboard_repeat_task_handle != NULL) {
+                vTaskDelete(keyboard_repeat_task_handle);
+                keyboard_repeat_task_handle = NULL;
+            }
+
             ble_connected = false;
             vTaskDelay(pdMS_TO_TICKS(5000));
             xTaskCreate(&ble_task, "ble_scan_retry", 8192, NULL, 5, NULL);
@@ -227,6 +265,12 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
 
     case ESP_HIDH_CLOSE_EVENT: {
         ESP_LOGI(BLE_HOST_TAG, "Device disconnected.");
+
+        if (keyboard_repeat_task_handle != NULL) {
+            vTaskDelete(keyboard_repeat_task_handle);
+            keyboard_repeat_task_handle = NULL;
+        }
+
         ble_connected = false;
         xTaskCreate(&ble_task, "ble_scan_retry", 8192, NULL, 5, NULL);
         break;
