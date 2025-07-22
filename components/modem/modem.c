@@ -353,7 +353,7 @@ void modem_task(void *arg) {
             ppp_set_ipcp_hisaddr(ppp, &peer_ip);
             ppp_set_ipcp_dnsaddr(ppp, 0, &dnsserver);
             ppp_set_ipcp_dnsaddr(ppp, 1, &dnsserver);
-            ppp_set_ipcp_dnsaddr(ppp, 2, &dnsserver);
+            //ppp_set_ipcp_dnsaddr(ppp, 2, &dnsserver);
 
             // Now connect PPP
             ESP_LOGI(PPP_TAG, "PPP local: " IPSTR ", peer: " IPSTR, IP2STR(&our_ip), IP2STR(&peer_ip));

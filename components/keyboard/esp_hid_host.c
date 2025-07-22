@@ -38,6 +38,11 @@ char current_ble_manufacturer[64] = "Unknown";
 
 static int ble_battery_level = -1;
 
+static bool current_shift = false;
+static bool shift_sent = false;
+
+static bool still_held[KB_BUFFER_SIZE];
+
 static const uint8_t hid_to_scancode[128] = {
     // Lowercase letters (HID 0x04–0x1D)
     // a           // b           // c           // d
@@ -92,6 +97,52 @@ static const uint8_t hid_to_scancode[128] = {
     [0x50] = 0x6B, // Left
     [0x51] = 0x72, // Down
     [0x52] = 0x75, // Up
+
+    [0x3A] = 0x05, // F1
+    [0x3B] = 0x06, // F2
+    [0x3C] = 0x04, // F3
+    [0x3D] = 0x0C, // F4
+    [0x3E] = 0x03, // F5
+    [0x3F] = 0x0B, // F6
+    [0x40] = 0x83, // F7
+    [0x41] = 0x0A, // F8
+    [0x42] = 0x01, // F9
+    [0x43] = 0x09, // F10
+    [0x44] = 0x78, // F11
+    [0x45] = 0x07, // F12
+
+    [0x4C] = 0x71, // Del
+};
+
+static const uint8_t hid_to_scancode_shifted[128] = {
+    [0x04] = 0x1C, [0x05] = 0x32, [0x06] = 0x21, [0x07] = 0x23,
+    [0x08] = 0x24, [0x09] = 0x2B, [0x0A] = 0x34, [0x0B] = 0x33,
+    [0x0C] = 0x43, [0x0D] = 0x3B, [0x0E] = 0x42, [0x0F] = 0x4B,
+    [0x10] = 0x3A, [0x11] = 0x31, [0x12] = 0x44, [0x13] = 0x4D,
+    [0x14] = 0x15, [0x15] = 0x2D, [0x16] = 0x1B, [0x17] = 0x2C,
+    [0x18] = 0x3C, [0x19] = 0x2A, [0x1A] = 0x1D, [0x1B] = 0x22,
+    [0x1C] = 0x35, [0x1D] = 0x1A,
+    [0x1E] = 0x16, [0x1F] = 0x1E, [0x20] = 0x26, [0x21] = 0x25,
+    [0x22] = 0x2E, [0x23] = 0x36, [0x24] = 0x3D, [0x25] = 0x3E,
+    [0x26] = 0x46, [0x27] = 0x45,
+    [0x2D] = 0x4E, [0x2E] = 0x55, [0x2F] = 0x54,
+    [0x30] = 0x5B, [0x31] = 0x5D, [0x33] = 0x4C, [0x34] = 0x52,
+    [0x35] = 0x0E, [0x36] = 0x41, [0x37] = 0x49, [0x38] = 0x4A,
+
+    [0x3A] = 0x05, // F1
+    [0x3B] = 0x06, // F2
+    [0x3C] = 0x04, // F3
+    [0x3D] = 0x0C, // F4
+    [0x3E] = 0x03, // F5
+    [0x3F] = 0x0B, // F6
+    [0x40] = 0x83, // F7
+    [0x41] = 0x0A, // F8
+    [0x42] = 0x01, // F9
+    [0x43] = 0x09, // F10
+    [0x44] = 0x78, // F11
+    [0x45] = 0x07, // F12
+
+    [0x4C] = 0x71, // Del
 };
 
 char *bda2str(uint8_t *bda, char *str, size_t size)
@@ -106,7 +157,7 @@ char *bda2str(uint8_t *bda, char *str, size_t size)
 }
 
 void keyboard_tick() {
-    bool still_held[256] = {0};
+    memset(still_held, 0, KB_BUFFER_SIZE);
 
     // Track which keys are still held
     for (int i = 0; i < MAX_KEYS; ++i) {
@@ -114,33 +165,82 @@ void keyboard_tick() {
         if (key == 0) continue;
         still_held[key] = true;
 
+        // Handle shift key modifiers
+        uint8_t scancode = current_shift && hid_to_scancode_shifted[key]
+                         ? hid_to_scancode_shifted[key]
+                         : hid_to_scancode[key];
+
         if (held_ticks[key] == 0) {
-            // Handle first press
-            queue_scancode(hid_to_scancode[key]);
+            // Handle first press and inject shift modifier if applicable, flag as sent
+            if (current_shift && !shift_sent) {
+                queue_scancode(0x12);
+                shift_sent = true;
+            }
+            // Send extended for Del
+            if (scancode == 0x71) {
+                queue_scancode(0xE0);
+            }
+            queue_scancode(scancode);
+
+        // Handle repeating
         } else if (held_ticks[key] >= REPEAT_DELAY_TICKS &&
-                   (held_ticks[key] - REPEAT_DELAY_TICKS) % REPEAT_INTERVAL_TICKS == 0) {
-            // Handle repeating
-            queue_scancode(hid_to_scancode[key]);
+                  (held_ticks[key] - REPEAT_DELAY_TICKS) % REPEAT_INTERVAL_TICKS == 0) {
+            // Send extended for Del
+            if (scancode == 0x71) {
+                queue_scancode(0xE0);
+            }
+            queue_scancode(scancode);
         }
 
         held_ticks[key]++;
     }
 
     // Reset tick counter for keys no longer held
-    for (int i = 0; i < 256; ++i) {
-        if (!still_held[i]) {
+    for (int i = 0; i < KB_BUFFER_SIZE; ++i) {
+        // Here we will need to handle BREAK codes for shifted keys, because otherwise the N64
+        // will assume all keys afterwards are shifted as it uses the BREAK to delimit shift depressed
+        if (!still_held[i] && held_ticks[i] != 0) {
+            uint8_t scancode = current_shift && hid_to_scancode_shifted[i]
+                ? hid_to_scancode_shifted[i]
+                : hid_to_scancode[i];
+            // BREAK prefix
+            queue_scancode(0xF0);
+            queue_scancode(scancode);
             held_ticks[i] = 0;
         }
     }
+
+    if (!current_shift && shift_sent) {
+        queue_scancode(0xF0);
+        queue_scancode(0x12);
+        shift_sent = false;
+    }
 }
 
-
 void handle_input(const uint8_t *data, size_t len) {
+    // Alright this shit is kind of a mess right now. Some BLE keyboards seem to
+    // have different key queue sizes, and so until I figure out a better way to handle that
+    // I'll just assume the payload offset based off its size for now (I'm sure there's a better
+    // way, I just haven't fully researched the protocol yet)
+
+    // For now the hack is basically if its length is 8, then the scancode offset starts at offset
+    // 2, and if it's less than that the scancode data starts at offset 1, with potentially the modifier
+    // bits offset starting at 1 for len of 8 and and 0 for length of less than 8, but I guess we will
+    // find out the hard way :D
     int sc_offset = 2;
     if (len < 8) sc_offset = 1;
     const uint8_t *keys = &data[sc_offset];
 
     memset(last_keys, 0, MAX_KEYS);
+
+    if (len >= 1) {
+        // This might need to be fixed later depending on what I figure out about where the modifiers
+        // are stored based on the payload length theory from earlier
+        uint8_t mods = data[0];
+
+        // check/set left and right shift modifier bits
+        current_shift = (mods & (1 << 1)) || (mods & (1 << 5));
+    }
 
     for (int i = 0; i < MAX_KEYS; ++i) {
         uint8_t key = keys[i];
@@ -216,7 +316,7 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
             init_gpio_keyboard();
 
             if (keyboard_repeat_task_handle == NULL) {
-            xTaskCreate(keyboard_repeat_task, "kbd_repeat", 2048, NULL, 5, &keyboard_repeat_task_handle);
+            xTaskCreate(keyboard_repeat_task, "kbd_repeat", 8192, NULL, 5, &keyboard_repeat_task_handle);
             }
 
             esp_hidh_dev_t *dev = param->open.dev;

@@ -16,7 +16,7 @@ extern "C" {
 //
 // So KB_TICK_RATE = 20 means the repeat task runs every 20 ms
 // and that comes to 50 times per second (1000ms ÷ 20ms = 50 Hz)
-#define KB_TICK_RATE 20
+#define KB_TICK_RATE 12
 
 // This is the number of keyboard_tick() calls to wait before the key starts repeating
 // and so if the tick happens every 20 ms, the total delay is:
@@ -34,7 +34,7 @@ extern "C" {
 // = 100 ms
 //
 // So once repeating starts, the key is sent again every 100ms (10 characters/second).
-#define REPEAT_INTERVAL_TICKS 5   // ~100ms repeat rate
+#define REPEAT_INTERVAL_TICKS 5  // ~100ms repeat rate
 
 // We use a software keyboard buffer
 #define KB_BUFFER_SIZE 64
