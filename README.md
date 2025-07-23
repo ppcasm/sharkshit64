@@ -19,16 +19,16 @@ This project (hopefully) intends to faithfully re-create the exerience of Intera
 This is all currently a WIP, but does include some basic functionality.
 
 What works:
-Sharkwire Online activation (pretty much as originally intended)
-Creating/Deleting users, as well as all original settings
-The internet over a WiFi connection (HTTP only @ 19200bps - for now)
-BLE Keyboards
-ESP32 AP based configuration tool
-Custom Sharkwire Online home page
+* Sharkwire Online activation (pretty much as originally intended)
+* Creating/Deleting users, as well as all original settings
+* The internet over a WiFi connection (HTTP only @ 19200bps - for now)
+* BLE Keyboards
+* ESP32 AP based configuration tool
+* Custom Sharkwire Online home page
 
 What doesn't work:
-HTTPS
-E-Mail (yet)
+* HTTPS
+* E-Mail (yet)
 
 Added software features:
 The ability go GOTO any (HTTP) website directly from the UI (a feature AFAIK never enabled on retail)
