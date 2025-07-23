@@ -14,7 +14,7 @@ The mission of this project is to show people who complain about things and wish
 
 Just kidding :p
 
-The project (hopefully) intends to faithfully re-create the exerience of Sharkwire online as it was during its very short lived release back in 1999, with potentially a few added features.
+The project (hopefully) intends to faithfully re-create the exerience of Interact's Sharkwire Online as it was during its very short lived release back in 1999, with potentially a few added features.
 
 This is all currently a WIP, but does include some basic functionality.
 
