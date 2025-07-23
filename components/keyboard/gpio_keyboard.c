@@ -7,9 +7,7 @@
 #include "esp_log.h"
 #include "esp_task_wdt.h"
 #include "esp_rom_sys.h"
-#include "gpio_keyboard.h"
-
-#define KB_TIMEOUT 5
+#include "keyboard.h"
 
 static const char *GPIO_KEYBOARD_TAG = "GPIO_KEYBOARD";
 

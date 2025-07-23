@@ -23,7 +23,7 @@
 #include "esp_hid_gap.h"
 
 #include "esp_hid_host.h"
-#include "gpio_keyboard.h"
+#include "keyboard.h"
 
 static const char *BLE_HOST_TAG = "BLE_HOST";
 
@@ -41,110 +41,62 @@ static int ble_battery_level = -1;
 static bool current_shift = false;
 static bool shift_sent = false;
 
-static bool still_held[KB_BUFFER_SIZE];
+static uint8_t still_held_bits[32] = {0};
 
-static const uint8_t hid_to_scancode[128] = {
-    // Lowercase letters (HID 0x04–0x1D)
-    // a           // b           // c           // d
-    [0x04] = 0x1C, [0x05] = 0x32, [0x06] = 0x21, [0x07] = 0x23,
-    // e           // f           // g           // h
-    [0x08] = 0x24, [0x09] = 0x2B, [0x0A] = 0x34, [0x0B] = 0x33,
-    // i           // j           // k           // l 
-    [0x0C] = 0x43, [0x0D] = 0x3B, [0x0E] = 0x42, [0x0F] = 0x4B,
-    // m           // n           // o           // p
-    [0x10] = 0x3A, [0x11] = 0x31, [0x12] = 0x44, [0x13] = 0x4D,
-    // q           // r           // s           // t
-    [0x14] = 0x15, [0x15] = 0x2D, [0x16] = 0x1B, [0x17] = 0x2C,
-    // u           // v           // w           // x
-    [0x18] = 0x3C, [0x19] = 0x2A, [0x1A] = 0x1D, [0x1B] = 0x22,
-    // y           // z
-    [0x1C] = 0x35, [0x1D] = 0x1A,
+#define IS_HELD(k)   (still_held_bits[(k) >> 3] & (1 << ((k) & 7)))
+#define SET_HELD(k)  (still_held_bits[(k) >> 3] |= (1 << ((k) & 7)))
+#define CLR_HELD(k)  (still_held_bits[(k) >> 3] &= ~(1 << ((k) & 7)))
 
-    // Digits (HID 0x1E–0x27)
-    [0x1E] = 0x16, // 1
-    [0x1F] = 0x1E, // 2
-    [0x20] = 0x26, // 3
-    [0x21] = 0x25, // 4
-    [0x22] = 0x2E, // 5
-    [0x23] = 0x36, // 6
-    [0x24] = 0x3D, // 7
-    [0x25] = 0x3E, // 8
-    [0x26] = 0x46, // 9
-    [0x27] = 0x45, // 0
-
-    // Space, symbols (HID 0x2C+)
-    [0x2C] = 0x29, // Space
-    [0x2D] = 0x4E, // -
-    [0x2E] = 0x55, // =
-    [0x2F] = 0x54, // [
-    [0x30] = 0x5B, // ]
-    [0x31] = 0x5D, //
-    [0x33] = 0x4C, // ;
-    [0x34] = 0x52, // '
-    [0x35] = 0x0E, // `
-    [0x36] = 0x41, // ,
-    [0x37] = 0x49, // .
-    [0x38] = 0x4A, // /
-
-    // Control keys
-    [0x28] = 0x5A, // Enter
-    [0x29] = 0x76, // ESC
-    [0x2B] = 0x0D, // Tab
-    [0x2A] = 0x66, // Backspace
-
-    // Arrows
-    [0x4F] = 0x74, // Right
-    [0x50] = 0x6B, // Left
-    [0x51] = 0x72, // Down
-    [0x52] = 0x75, // Up
-
-    [0x3A] = 0x05, // F1
-    [0x3B] = 0x06, // F2
-    [0x3C] = 0x04, // F3
-    [0x3D] = 0x0C, // F4
-    [0x3E] = 0x03, // F5
-    [0x3F] = 0x0B, // F6
-    [0x40] = 0x83, // F7
-    [0x41] = 0x0A, // F8
-    [0x42] = 0x01, // F9
-    [0x43] = 0x09, // F10
-    [0x44] = 0x78, // F11
-    [0x45] = 0x07, // F12
-
-    [0x4C] = 0x71, // Del
+// This is used to do HID to PS/2 scancode mapping with shifted tables
+//
+// For now we will just waste some flash space and keep 2 tables with
+// the same data in case we want to remap something in the future
+static const uint8_t scancode_table[2][128] = {
+        [0x00] = {
+        [0x04] = 0x1C, [0x05] = 0x32, [0x06] = 0x21, [0x07] = 0x23,
+        [0x08] = 0x24, [0x09] = 0x2B, [0x0A] = 0x34, [0x0B] = 0x33,
+        [0x0C] = 0x43, [0x0D] = 0x3B, [0x0E] = 0x42, [0x0F] = 0x4B,
+        [0x10] = 0x3A, [0x11] = 0x31, [0x12] = 0x44, [0x13] = 0x4D,
+        [0x14] = 0x15, [0x15] = 0x2D, [0x16] = 0x1B, [0x17] = 0x2C,
+        [0x18] = 0x3C, [0x19] = 0x2A, [0x1A] = 0x1D, [0x1B] = 0x22,
+        [0x1C] = 0x35, [0x1D] = 0x1A,
+        [0x1E] = 0x16, [0x1F] = 0x1E, [0x20] = 0x26, [0x21] = 0x25,
+        [0x22] = 0x2E, [0x23] = 0x36, [0x24] = 0x3D, [0x25] = 0x3E,
+        [0x26] = 0x46, [0x27] = 0x45,
+        [0x2C] = 0x29, [0x2D] = 0x4E, [0x2E] = 0x55, [0x2F] = 0x54,
+        [0x30] = 0x5B, [0x31] = 0x5D, [0x33] = 0x4C, [0x34] = 0x52,
+        [0x35] = 0x0E, [0x36] = 0x41, [0x37] = 0x49, [0x38] = 0x4A,
+        [0x28] = 0x5A, [0x29] = 0x76, [0x2B] = 0x0D, [0x2A] = 0x66,
+        [0x4F] = 0x74, [0x50] = 0x6B, [0x51] = 0x72, [0x52] = 0x75,
+        [0x3A] = 0x05, [0x3B] = 0x06, [0x3C] = 0x04, [0x3D] = 0x0C,
+        [0x3E] = 0x03, [0x3F] = 0x0B, [0x40] = 0x83, [0x41] = 0x0A,
+        [0x42] = 0x01, [0x43] = 0x09, [0x44] = 0x78, [0x45] = 0x07,
+        [0x4C] = 0x71
+    },
+        [0x01] = {
+        [0x04] = 0x1C, [0x05] = 0x32, [0x06] = 0x21, [0x07] = 0x23,
+        [0x08] = 0x24, [0x09] = 0x2B, [0x0A] = 0x34, [0x0B] = 0x33,
+        [0x0C] = 0x43, [0x0D] = 0x3B, [0x0E] = 0x42, [0x0F] = 0x4B,
+        [0x10] = 0x3A, [0x11] = 0x31, [0x12] = 0x44, [0x13] = 0x4D,
+        [0x14] = 0x15, [0x15] = 0x2D, [0x16] = 0x1B, [0x17] = 0x2C,
+        [0x18] = 0x3C, [0x19] = 0x2A, [0x1A] = 0x1D, [0x1B] = 0x22,
+        [0x1C] = 0x35, [0x1D] = 0x1A,
+        [0x1E] = 0x16, [0x1F] = 0x1E, [0x20] = 0x26, [0x21] = 0x25,
+        [0x22] = 0x2E, [0x23] = 0x36, [0x24] = 0x3D, [0x25] = 0x3E,
+        [0x26] = 0x46, [0x27] = 0x45,
+        [0x2D] = 0x4E, [0x2E] = 0x55, [0x2F] = 0x54,
+        [0x30] = 0x5B, [0x31] = 0x5D, [0x33] = 0x4C, [0x34] = 0x52,
+        [0x35] = 0x0E, [0x36] = 0x41, [0x37] = 0x49, [0x38] = 0x4A,
+        [0x3A] = 0x05, [0x3B] = 0x06, [0x3C] = 0x04, [0x3D] = 0x0C,
+        [0x3E] = 0x03, [0x3F] = 0x0B, [0x40] = 0x83, [0x41] = 0x0A,
+        [0x42] = 0x01, [0x43] = 0x09, [0x44] = 0x78, [0x45] = 0x07,
+        [0x4C] = 0x71
+    }
 };
 
-static const uint8_t hid_to_scancode_shifted[128] = {
-    [0x04] = 0x1C, [0x05] = 0x32, [0x06] = 0x21, [0x07] = 0x23,
-    [0x08] = 0x24, [0x09] = 0x2B, [0x0A] = 0x34, [0x0B] = 0x33,
-    [0x0C] = 0x43, [0x0D] = 0x3B, [0x0E] = 0x42, [0x0F] = 0x4B,
-    [0x10] = 0x3A, [0x11] = 0x31, [0x12] = 0x44, [0x13] = 0x4D,
-    [0x14] = 0x15, [0x15] = 0x2D, [0x16] = 0x1B, [0x17] = 0x2C,
-    [0x18] = 0x3C, [0x19] = 0x2A, [0x1A] = 0x1D, [0x1B] = 0x22,
-    [0x1C] = 0x35, [0x1D] = 0x1A,
-    [0x1E] = 0x16, [0x1F] = 0x1E, [0x20] = 0x26, [0x21] = 0x25,
-    [0x22] = 0x2E, [0x23] = 0x36, [0x24] = 0x3D, [0x25] = 0x3E,
-    [0x26] = 0x46, [0x27] = 0x45,
-    [0x2D] = 0x4E, [0x2E] = 0x55, [0x2F] = 0x54,
-    [0x30] = 0x5B, [0x31] = 0x5D, [0x33] = 0x4C, [0x34] = 0x52,
-    [0x35] = 0x0E, [0x36] = 0x41, [0x37] = 0x49, [0x38] = 0x4A,
-
-    [0x3A] = 0x05, // F1
-    [0x3B] = 0x06, // F2
-    [0x3C] = 0x04, // F3
-    [0x3D] = 0x0C, // F4
-    [0x3E] = 0x03, // F5
-    [0x3F] = 0x0B, // F6
-    [0x40] = 0x83, // F7
-    [0x41] = 0x0A, // F8
-    [0x42] = 0x01, // F9
-    [0x43] = 0x09, // F10
-    [0x44] = 0x78, // F11
-    [0x45] = 0x07, // F12
-
-    [0x4C] = 0x71, // Del
-};
-
+// bda2str
+// This takes the BLE device address and turns it into a 
+// proper string format
 char *bda2str(uint8_t *bda, char *str, size_t size)
 {
     if (bda == NULL || str == NULL || size < 18) {
@@ -156,54 +108,50 @@ char *bda2str(uint8_t *bda, char *str, size_t size)
     return str;
 }
 
+// keyboard_tick
+// This is ran from the keyboard_repeat_task and does most of the heavy lifting of processing
+// the inputs by moving through the keys that get buffered through BLE input, and then building
+// a proper PS/2 scancode format with MAKE/BREAK and shifted codes, along with the outlier for
+// the Del key, which uses the extended code format, and places them in the scancode queue that
+// gets processed in 'gpio_keyboard.c'
+//
+// It runs at an interval from a separate task (keyboard_repeat_task) in such a way because BLE 
+// devices don't actually handle any kind of interval control, so we must create our own to mimic
+// key repeating, and these timings can be set in 'keyboard.h' to allow customizations
+//
+// It should also be noted that Sharkwire expects BREAK codes to be sent with shifted codes
+// or it'll stick in a shifted state as it uses 0xF0 BREAK to delimit the depress of the
+// shift key
 void keyboard_tick() {
-    memset(still_held, 0, KB_BUFFER_SIZE);
+    memset(still_held_bits, 0, sizeof(still_held_bits));
 
-    // Track which keys are still held
     for (int i = 0; i < MAX_KEYS; ++i) {
         uint8_t key = last_keys[i];
         if (key == 0) continue;
-        still_held[key] = true;
+        SET_HELD(key);
 
-        // Handle shift key modifiers
-        uint8_t scancode = current_shift && hid_to_scancode_shifted[key]
-                         ? hid_to_scancode_shifted[key]
-                         : hid_to_scancode[key];
+        uint8_t scancode = scancode_table[current_shift][key];
 
         if (held_ticks[key] == 0) {
-            // Handle first press and inject shift modifier if applicable, flag as sent
             if (current_shift && !shift_sent) {
                 queue_scancode(0x12);
                 shift_sent = true;
             }
-            // Send extended for Del
-            if (scancode == 0x71) {
-                queue_scancode(0xE0);
-            }
+            if (scancode == 0x71) queue_scancode(0xE0);
             queue_scancode(scancode);
-
-        // Handle repeating
-        } else if (held_ticks[key] >= REPEAT_DELAY_TICKS &&
-                  (held_ticks[key] - REPEAT_DELAY_TICKS) % REPEAT_INTERVAL_TICKS == 0) {
-            // Send extended for Del
-            if (scancode == 0x71) {
-                queue_scancode(0xE0);
-            }
+        } else if (held_ticks[key] == REPEAT_DELAY_TICKS ||
+                  ((held_ticks[key] > REPEAT_DELAY_TICKS) &&
+                  ((held_ticks[key] - REPEAT_DELAY_TICKS) & (REPEAT_INTERVAL_TICKS - 1)) == 0)) {
+            if (scancode == 0x71) queue_scancode(0xE0);
             queue_scancode(scancode);
         }
 
         held_ticks[key]++;
     }
 
-    // Reset tick counter for keys no longer held
-    for (int i = 0; i < KB_BUFFER_SIZE; ++i) {
-        // Here we will need to handle BREAK codes for shifted keys, because otherwise the N64
-        // will assume all keys afterwards are shifted as it uses the BREAK to delimit shift depressed
-        if (!still_held[i] && held_ticks[i] != 0) {
-            uint8_t scancode = current_shift && hid_to_scancode_shifted[i]
-                ? hid_to_scancode_shifted[i]
-                : hid_to_scancode[i];
-            // BREAK prefix
+    for (int i = 0; i < 128; ++i) {
+        if (!IS_HELD(i) && held_ticks[i] != 0) {
+            uint8_t scancode = scancode_table[current_shift][i];
             queue_scancode(0xF0);
             queue_scancode(scancode);
             held_ticks[i] = 0;
@@ -217,38 +165,31 @@ void keyboard_tick() {
     }
 }
 
+// handle_input
+// This is called from the BLE HIDH input event and takes in the BLE input "buffered keys"
+// and sets the data, as well as the shift masking that gets processed during the keyboard_tick
+// function that runs from the keyboard_repeat_task effectively allowing this to fill the correct
+// structures to allow input to be processed
 void handle_input(const uint8_t *data, size_t len) {
-    // Alright this shit is kind of a mess right now. Some BLE keyboards seem to
-    // have different key queue sizes, and so until I figure out a better way to handle that
-    // I'll just assume the payload offset based off its size for now (I'm sure there's a better
-    // way, I just haven't fully researched the protocol yet)
-
-    // For now the hack is basically if its length is 8, then the scancode offset starts at offset
-    // 2, and if it's less than that the scancode data starts at offset 1, with potentially the modifier
-    // bits offset starting at 1 for len of 8 and and 0 for length of less than 8, but I guess we will
-    // find out the hard way :D
-    int sc_offset = 2;
-    if (len < 8) sc_offset = 1;
+    int sc_offset = len < 8 ? 1 : 2;
     const uint8_t *keys = &data[sc_offset];
 
-    memset(last_keys, 0, MAX_KEYS);
+    for (int i = 0; i < MAX_KEYS; ++i) last_keys[i] = 0;
 
     if (len >= 1) {
-        // This might need to be fixed later depending on what I figure out about where the modifiers
-        // are stored based on the payload length theory from earlier
         uint8_t mods = data[0];
-
-        // check/set left and right shift modifier bits
         current_shift = (mods & (1 << 1)) || (mods & (1 << 5));
     }
 
     for (int i = 0; i < MAX_KEYS; ++i) {
         uint8_t key = keys[i];
-        if (key == 0) continue;
-        last_keys[i] = key;
+        if (key) last_keys[i] = key;
     }
 }
 
+// keyboard_repeat_task
+// This is responsible for allowing the BLE key to be repeated if held, and
+// helps us time it at a specific rate
 void keyboard_repeat_task(void *arg) {
     while (1) {
         keyboard_tick();
@@ -256,20 +197,33 @@ void keyboard_repeat_task(void *arg) {
     }
 }
 
+// get_ble_battery_level
+// We use this to return the BLE battery level is applicable, and it's mainly
+// used in the 'http_ui" component to show battery level in BLE status
 int get_ble_battery_level(void) {
     return ble_battery_level;
 }
 
+// get_bonded_device_address
+// Obviously gets the device address of our (1) allowed bonded device, again
+// it's mainly used in the 'http_ui' component to display the address of the
+// currently bonded device
 bool get_bonded_device_address(esp_bd_addr_t out_bda) {
     if (!bda_valid) return false;
     memcpy(out_bda, last_bonded_bda, sizeof(esp_bd_addr_t));
     return true;
 }
 
+// is_ble_connected
+// This returns connected state, mostly to expose it to 'http_ui' so that we
+// can show whether a BLE device is currently and actively connected
 bool is_ble_connected(void) {
     return ble_connected;
 }
 
+// ble_set_manufacturer
+// This allows us to set the manufacturer when the data comes through so it
+// can be ready for the 'http_ui' BLE status, where it's displayed
 void ble_set_manufacturer(const char *value) {
     strncpy(current_ble_manufacturer,
             value ? value : "Unknown",
@@ -277,10 +231,16 @@ void ble_set_manufacturer(const char *value) {
     current_ble_manufacturer[sizeof(current_ble_manufacturer) - 1] = '\0';
 }
 
+// get_ble_manufacturer
+// This is where we get the manufacturer that's set from the 'ble_set_manufacturer' function
+// and is used to display BLE manufacturer in the 'http_ui' component
 const char *get_ble_manufacturer(void) {
     return current_ble_manufacturer;
 }
 
+// unbond_ble_device
+// This is used to unpair/unbond our single supported device that's saved in NVS, and this
+// gets exposed through 'http_ui' to easily allow us to do this through a webUI button
 bool unbond_ble_device(void) {
     esp_bd_addr_t bda;
     int dev_num = esp_ble_get_bond_device_num();
@@ -301,6 +261,9 @@ bool unbond_ble_device(void) {
     return false;
 }
 
+// hidh_callback
+// Part of the Bluedroid stack that handles OPEN/INPUT/CLOSE/BATTERY and a few other events
+// that let you setup how you want these events to be handled
 void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *event_data)
 {
     esp_hidh_event_t event = (esp_hidh_event_t)id;
@@ -316,7 +279,7 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
             init_gpio_keyboard();
 
             if (keyboard_repeat_task_handle == NULL) {
-            xTaskCreate(keyboard_repeat_task, "kbd_repeat", 8192, NULL, 5, &keyboard_repeat_task_handle);
+            xTaskCreate(keyboard_repeat_task, "keyboard_repeat_task", KBD_REPEAT_TASK_SIZE, NULL, KBD_REPEAT_TASK_PRI, &keyboard_repeat_task_handle);
             }
 
             esp_hidh_dev_t *dev = param->open.dev;
@@ -333,7 +296,7 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
 
             ble_connected = false;
             vTaskDelay(pdMS_TO_TICKS(5000));
-            xTaskCreate(&ble_task, "ble_scan_retry", 8192, NULL, 5, NULL);
+            xTaskCreate(&ble_task, "ble_scan_retry", BLE_TASK_SIZE, NULL, BLE_TASK_PRI, NULL);
         }
         break;
     }
@@ -352,13 +315,14 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
     case ESP_HIDH_INPUT_EVENT: {
         const uint8_t *bda = esp_hidh_dev_bda_get(param->input.dev);
         if (bda) {
-            ESP_LOGI(BLE_HOST_TAG, ESP_BD_ADDR_STR " INPUT: %8s, MAP: %2u, ID: %3u, Len: %d, Data:", 
-            ESP_BD_ADDR_HEX(bda), esp_hid_usage_str(param->input.usage), param->input.map_index, 
-            param->input.report_id, param->input.length);
+            //ESP_LOGI(BLE_HOST_TAG, ESP_BD_ADDR_STR " INPUT: %8s, MAP: %2u, ID: %3u, Len: %d, Data:", 
+            //ESP_BD_ADDR_HEX(bda), esp_hid_usage_str(param->input.usage), param->input.map_index, 
+            //param->input.report_id, param->input.length);
             
-            handle_input(param->input.data, param->input.length);
-
-            ESP_LOG_BUFFER_HEX(BLE_HOST_TAG, param->input.data, param->input.length);
+            if (!strncmp(esp_hid_usage_str(param->input.usage), "KEYBOARD", 8)) {
+                handle_input(param->input.data, param->input.length);
+                //ESP_LOG_BUFFER_HEX(BLE_HOST_TAG, param->input.data, param->input.length);
+            }
         }
         break;
     }
@@ -372,7 +336,7 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
         }
 
         ble_connected = false;
-        xTaskCreate(&ble_task, "ble_scan_retry", 8192, NULL, 5, NULL);
+        xTaskCreate(&ble_task, "ble_scan_retry", BLE_TASK_SIZE, NULL, BLE_TASK_PRI, NULL);
         break;
     }
 
@@ -381,6 +345,9 @@ void hidh_callback(void *handler_args, esp_event_base_t base, int32_t id, void *
     }
 }
 
+// ble_task
+// This is mostly used to setup the BLE scanning mechanism, and bonding mechanism, and re-opening
+// bonded BLE devices once they're set up
 void ble_task(void *args)
 {
     // Check for bonded devices

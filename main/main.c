@@ -15,8 +15,9 @@
 #include "esp_gatt_defs.h"
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
+
 #include "modem.h"
-#include "gpio_keyboard.h"
+#include "keyboard.h"
 
 static const char *MAIN_TAG = "MAIN";
 
@@ -52,8 +53,8 @@ void app_main(void) {
     ESP_LOGI(MAIN_TAG, "Own address:[%s]", bda2str((uint8_t *)esp_bt_dev_get_address(), bda_str, sizeof(bda_str)));
 
     // Start the BLE side of the keyboard interface
-    xTaskCreate(&ble_task, "ble_task", 8192, NULL, 5, NULL);
+    xTaskCreate(&ble_task, "ble_task", BLE_TASK_SIZE, NULL, BLE_TASK_PRI, NULL);
 
     // Start the UART modem interface task
-    xTaskCreatePinnedToCore(modem_task, "modem_task", 8192, NULL, 10, NULL, 1);
+    xTaskCreatePinnedToCore(modem_task, "modem_task", MODEM_TASK_SIZE, NULL, MODEM_TASK_PRI, NULL, 1);
 }
