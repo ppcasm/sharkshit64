@@ -29,9 +29,15 @@ What works:
 What doesn't work:
 * HTTPS
 * E-Mail (yet)
+* Pretty much most of the internet websites in use today
 
 Added software features:
 The ability go GOTO any (HTTP) website directly from the UI (a feature AFAIK never enabled on retail)
+
+The User-Agent is defined as "Mozilla/3.0 (compatible, Spyglass DM 3.2; N64_KAOS)"
+and is a very old and basic version of Mosaic that supports limited HTML, and no CSS/Javascript/HTML5/Etc
+
+Keep all of this in mind when trying to use it in a "practical" manner, or you'll be severely disappointed :-)
 
 ### Usage
 You'll likely want to just obtain the SharkShit64 open source ESP32 based Interact Sharkwire Online clone cart, but one could potentially build one out of an Interact GameShark, but it requires some very specific components and probably not worth all of the work needed to achieve this.
