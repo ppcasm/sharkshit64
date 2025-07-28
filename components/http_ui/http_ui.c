@@ -1,11 +1,22 @@
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <ctype.h>
+
 #include "nvs_flash.h"
 #include "esp_log.h"
 #include "esp_wifi_types.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 
 #include "esp_hid_host.h"
 #include "http_ui.h"
 #include "modem.h"
+
+// Used in our gamegenie proxy
+#define INITIAL_BUFFER_SIZE 4096
+#define MAX_DOWNLOAD_SIZE (256 * 1024)
 
 #ifndef MIN
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
@@ -203,175 +214,430 @@ static esp_err_t ble_status_get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// add_line_breaks
+// This was a quick hack to do some parsing on the <pre> tag data from
+// our gamegenie proxy, because I didn't like the way it rendered preformatted
+// text, so I did away with that and just forced line breaks because it looked
+// better when using non pre tag font sizing
+char *add_line_breaks(const char *input, size_t *out_len) {
+    size_t len = strlen(input);
+    char *output = malloc(len * 6 + 1);
+    if (!output) return NULL;
+
+    size_t i = 0, j = 0;
+    while (i < len) {
+        // Skip opening <pre> tags
+        if (strncasecmp(&input[i], "<pre", 4) == 0) {
+            i += 4;
+            while (i < len && input[i] != '>') i++;
+            if (i < len && input[i] == '>') i++;
+            continue;
+        }
+
+        // Skip closing </pre> tag
+        if (strncasecmp(&input[i], "</pre>", 6) == 0) {
+            i += 6;
+            continue;
+        }
+
+        // Copy character and insert <br> after newline
+        char c = input[i++];
+        output[j++] = c;
+        if (c == '\n') {
+            memcpy(&output[j], "<br>", 4);
+            j += 4;
+        }
+    }
+
+    output[j] = '\0';
+    if (out_len) *out_len = j;
+    return output;
+}
+
+// extract_section
+// This is used as a quick hack to extract sections by markers, used mostly to piece together the sections for
+// the gamegenie.com proxy
+static char *extract_section(const char *start_marker, const char *end_marker, const char *source, size_t *out_len) {
+    char *start = strstr(source, start_marker);
+    if (!start) return NULL;
+    start += strlen(start_marker);
+
+    char *end = strstr(start, end_marker);
+    if (!end || end <= start) return NULL;
+
+    *out_len = end - start;
+    char *result = malloc(*out_len + 1);
+    if (!result) return NULL;
+
+    strncpy(result, start, *out_len);
+    result[*out_len] = '\0';
+    return result;
+}
+
+// gamegenie_proxy_handler
+// Basically this handles access to gamegenie.com which we use for the 
+// "Gamerz" Sharkwire home page link, and this works by going directly to the gameshark
+// section of the gamegenie.com website via the Gamerz link, then that causes our custom DNS
+// server to point to ESP32, which then causes it to go here via a registered handler for the
+// specified path. When that happens, ESP32 will then reach out to the HTTPS version of the site
+// and extract the needed HTML sections in order to build a (hopefully) compatible stripped down
+// interface that renders in the content section of our sharkwire online home page
+esp_err_t gamegenie_proxy_handler(httpd_req_t *req) {
+    const char *base_path = "/cheats/gameshark/n64/";
+    const char *request_path = req->uri;
+
+    if (strncmp(request_path, base_path, strlen(base_path)) != 0) {
+        httpd_resp_send_err(req, 400, "invalid path");
+        return ESP_FAIL;
+    }
+
+    char *full_url = malloc(1024);
+    if (!full_url) {
+        httpd_resp_send_err(req, 500, "malloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(full_url, 1024, "https://gamegenie.com%s", request_path);
+
+    esp_http_client_config_t config = {
+        .url = full_url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 8000,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        free(full_url);
+        httpd_resp_send_err(req, 502, "client init failed");
+        return ESP_FAIL;
+    }
+
+    if (esp_http_client_open(client, 0) != ESP_OK) {
+        esp_http_client_cleanup(client);
+        free(full_url);
+        httpd_resp_send_err(req, 502, "open failed");
+        return ESP_FAIL;
+    }
+
+    if (esp_http_client_fetch_headers(client) < 0) {
+        esp_http_client_cleanup(client);
+        free(full_url);
+        httpd_resp_send_err(req, 502, "failed to fetch headers");
+        return ESP_FAIL;
+    }
+
+    char *body = malloc(INITIAL_BUFFER_SIZE);
+    if (!body) {
+        esp_http_client_cleanup(client);
+        free(full_url);
+        httpd_resp_send_err(req, 500, "malloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t capacity = INITIAL_BUFFER_SIZE;
+    size_t total = 0;
+
+    while (1) {
+        if (total + 1024 > capacity) {
+            if (capacity >= MAX_DOWNLOAD_SIZE) {
+                free(body);
+                free(full_url);
+                esp_http_client_cleanup(client);
+                httpd_resp_send_err(req, 500, "body too large");
+                return ESP_FAIL;
+            }
+            capacity *= 2;
+            char *new_body = realloc(body, capacity);
+            if (!new_body) {
+                free(body);
+                free(full_url);
+                esp_http_client_cleanup(client);
+                httpd_resp_send_err(req, 500, "realloc failed");
+                return ESP_ERR_NO_MEM;
+            }
+            body = new_body;
+        }
+
+        int r = esp_http_client_read(client, body + total, capacity - total);
+        if (r < 0) {
+            free(body);
+            free(full_url);
+            esp_http_client_cleanup(client);
+            httpd_resp_send_err(req, 502, "read failed");
+            return ESP_FAIL;
+        } else if (r == 0) {
+            break;
+        }
+        total += r;
+    }
+
+    body[total] = '\0';
+    esp_http_client_cleanup(client);
+    free(full_url);
+
+    const char *start_marker = strstr(request_path, "index.html") ? "<!-- NAME -->" : "<!-- GAME CHEATS -->";
+    const char *end_marker = "<!-- DNET LINKS & BANNER -->";
+
+    size_t content_len = 0;
+    char *raw_content = extract_section(start_marker, end_marker, body, &content_len);
+    if (!raw_content) { free(body); httpd_resp_send_err(req, 500, "no content"); return ESP_FAIL; }
+
+    char *content = raw_content;
+    if (!strstr(request_path, "index.html")) {
+        size_t new_len = 0;
+        content = add_line_breaks(raw_content, &new_len);
+        free(raw_content);
+        if (!content) { free(body); httpd_resp_send_err(req, 500, "br insert failed"); return ESP_FAIL; }
+        content_len = new_len;
+    }
+
+    size_t title_len = 0;
+    char *title = extract_section("<!-- NAME -->", "<!-- /NAME -->", body, &title_len);
+
+    if (!content || !title) {
+        free(body);
+        if (content) free(content);
+        if (title) free(title);
+        httpd_resp_send_err(req, 500, "required sections not found");
+        return ESP_FAIL;
+    }
+
+   const char *html_template =
+    "<html><head><title>%s</title></head>"
+    "<center><font size=\"1\">Powered by gamegenie.com</font></center>"
+    // SharkWire color scheme: "<body bgcolor=\"#000099\" text=\"#E0E040\" link=\"#FFCC00\" vlink=\"#FFCC00\" alink=\"#FFCC00\">"
+    "<body bgcolor=\"#FFFFFF\" text=\"#000000\" link=\"#0000FF\" vlink=\"#800080\" alink=\"#FF0000\">"
+    "<font size=\"1\">%s</font>"
+    "</body></html>";
+
+    size_t html_len = strlen(html_template) + title_len + content_len + 1;
+
+    char *full_html = malloc(html_len);
+    if (!full_html) {
+        free(body);
+        free(content);
+        free(title);
+        httpd_resp_send_err(req, 500, "malloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(full_html, html_len, html_template, title, content);
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, full_html, strlen(full_html));
+
+    free(full_html);
+    free(body);
+    free(content);
+    free(title);
+    return ESP_OK;
+}
+
 // config_get_handler
 // This handles the GET request of the config WiFi credentials setup page that displays at 192.168.4.1
 // when you connect to the ESP32 SSID while its AP is running, and it also shows the current bonded
 // BLE device information (we only support 1 for now)
 esp_err_t config_get_handler(httpd_req_t *req) {
-    wifi_config_t sta_config = {0};
 
-    char *html = malloc(4096);
-    if (!html) {
-        free(html);
-        ESP_LOGE("CONFIG", "Memory allocation failed");
-        return ESP_ERR_NO_MEM;
-    }
+   wifi_config_t sta_config = {0};
 
-    bool has_sta = load_sta_credentials(&sta_config);
+   char *html = malloc(4096);
+   if (!html) {
+       free(html);
+       ESP_LOGE("CONFIG", "Memory allocation failed");
+       return ESP_ERR_NO_MEM;
+   }
+    
+   bool has_sta = load_sta_credentials(&sta_config);
 
-    // Ensure null termination on NVS string
-    sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = 0;
-    sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = 0;
+   // Ensure null termination on NVS string
+   sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = 0;
+   sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = 0;
 
-char *ble_section = malloc(512);
-if (!ble_section) {
-    free(html);
-    ESP_LOGE("CONFIG", "Memory allocation failed");
-    return ESP_ERR_NO_MEM;
-}
+   char *ble_section = malloc(512);
+   if (!ble_section) {
+       free(html);
+       ESP_LOGE("CONFIG", "Memory allocation failed");
+       return ESP_ERR_NO_MEM;
+   }
 
-char bda_str[64] = "N/A";
-esp_bd_addr_t bda;
+   char bda_str[64] = "N/A";
+   esp_bd_addr_t bda;
 
-if (get_bonded_device_address(bda)) {
-    snprintf(bda_str, sizeof(bda_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-             bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
-}
+   if (get_bonded_device_address(bda)) {
+       snprintf(bda_str, sizeof(bda_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+           bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+   }
 
-bool connected = is_ble_connected();
-int battery = get_ble_battery_level();
-char battery_str[16] = "N/A";
-if (connected && battery >= 0) {
-    if (battery > 100) battery = 100;
-    snprintf(battery_str, sizeof(battery_str), "%d%%", battery);
-}
+   bool connected = is_ble_connected();
+   int battery = get_ble_battery_level();
+   char battery_str[16] = "N/A";
+   if (connected && battery >= 0) {
+       if (battery > 100) battery = 100;
+       snprintf(battery_str, sizeof(battery_str), "%d%%", battery);
+   }
 
-char restart_n64_msg[128] = "";
-if (strcmp(bda_str, "N/A") == 0 && connected) {
-    snprintf(restart_n64_msg, sizeof(restart_n64_msg),
-        "<strong><p style=\"color:red;\">Power cycle the Nintendo64 to finalize BLE bonding</p></strong>");
-}
+   char restart_n64_msg[128] = "";
+   if (strcmp(bda_str, "N/A") == 0 && connected) {
+       snprintf(restart_n64_msg, sizeof(restart_n64_msg),
+           "<strong><p style=\"color:red;\">Power cycle the Nintendo64 to finalize BLE bonding</p></strong>");
+   }
 
-snprintf(ble_section, 512,
-    "<center><h3>BLE Status</h3></center>"
-    "<p>Bonded Device: %s</p>"
-    "<p>Connected: %s</p>"
-    "<p>Manufacturer: %s</p>"
-    "<p>Battery: %s</p>"
-    "%s"
-    "<form method=\"POST\" action=\"/unbond_ble_device\">"
-        "<input type=\"submit\" value=\"Unbond BLE Device\">"
-        "</form>",
-        bda_str,
-        connected ? "Yes" : "No",
-        get_ble_manufacturer(),
-        battery_str,
-        restart_n64_msg
-    );
+   snprintf(ble_section, 512,
+       "<center><h3>BLE Status</h3></center>"
+       "<p>Bonded Device: %s</p>"
+       "<p>Connected: %s</p>"
+       "<p>Manufacturer: %s</p>"
+       "<p>Battery: %s</p>"
+       "%s"
+       "<form method=\"POST\" action=\"/unbond_ble_device\">"
+       "<input type=\"submit\" value=\"Unbond BLE Device\">"
+       "</form>",
+       bda_str,
+       connected ? "Yes" : "No",
+       get_ble_manufacturer(),
+       battery_str,
+       restart_n64_msg
+   );
 
-    int html_len;
-    if (has_sta) {
-        html_len = snprintf(html, 4096,
-            "<html><head><style>"
-            "body { background:white; color:black; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; }"
-            ".container { width: 400px; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
-            "input[type=text], input[type=password] { width:100%%; padding:8px; margin:6px 0; box-sizing:border-box; }"
-            "input[type=submit] { width:100%%; padding:10px; background:#007acc; color:white; border:none; border-radius:4px; cursor:pointer; }"
-            "input[type=submit]:hover { background:#005f99; }"
-            "</style></head><body><div class='container'>"
-            "<center><h1><strong>SharkShit64</strong></h1></center>"
-            "<center><h3>Wi-Fi Settings</h3></center>"
-            "<form method='POST'>"
-            "SSID:<input type='text' name='ssid' value='%s'><br>"
-            "Password:<input type='password' name='pass' value='%s'><br>"
-            "<input type='submit' value='Save WiFi Credentials'></form>"
-            "<div id='ble-status'>%s</div>"
-            "</div>"
-            "<script>"
-            "function updateBLE() {"
-            "  var xhr = new XMLHttpRequest();"
-            "  xhr.onreadystatechange = function() {"
-            "    if (xhr.readyState == 4 && xhr.status == 200) {"
-            "      document.getElementById('ble-status').innerHTML = xhr.responseText;"
-            "    }"
-            "  };"
-            "  xhr.open('GET', '/ble_status', true);"
-            "  xhr.send();"
-            "}"
-            "setInterval(updateBLE, 5000);"
-            "</script>"
-            "</body></html>",
-            (char *)sta_config.sta.ssid,
-            (char *)sta_config.sta.password,
-            ble_section
-        );
-    } else {
-        html_len = snprintf(html, 4096,
-            "<html><head><style>"
-            "body { background:white; color:black; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; }"
-            ".container { width: 400px; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
-            "input[type=text], input[type=password] { width:100%%; padding:8px; margin:6px 0; box-sizing:border-box; }"
-            "input[type=submit] { width:100%%; padding:10px; background:#007acc; color:white; border:none; border-radius:4px; cursor:pointer; }"
-            "input[type=submit]:hover { background:#005f99; }"
-            "</style></head><body><div class='container'>"
-            "<center><h1><strong>SharkShit64</strong></h1></center>"
-            "<center><h3>Wi-Fi Settings</h3></center>"
-            "<form method='POST'>"
-            "SSID:<input type='text' name='ssid'><br>"
-            "Password:<input type='password' name='pass'><br>"
-            "<input type='submit' value='Save Wifi Credentials'></form>"
-            "<div id='ble-status'>%s</div>"
-            "</div>"
-            "<script>"
-            "function updateBLE() {"
-            "  var xhr = new XMLHttpRequest();"
-            "  xhr.onreadystatechange = function() {"
-            "    if (xhr.readyState == 4 && xhr.status == 200) {"
-            "      document.getElementById('ble-status').innerHTML = xhr.responseText;"
-            "    }"
-            "  };"
-            "  xhr.open('GET', '/ble_status', true);"
-            "  xhr.send();"
-            "}"
-            "setInterval(updateBLE, 5000);"
-            "</script>"
-            "</body></html>",
-            ble_section
-        );
-    }
+   int html_len;
+   if (has_sta) {
+       html_len = snprintf(html, 4096,
+           "<html><head><style>"
+           "body { background:white; color:black; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; }"
+           ".container { width: 400px; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
+           "input[type=text], input[type=password] { width:100%%; padding:8px; margin:6px 0; box-sizing:border-box; }"
+           "input[type=submit] { width:100%%; padding:10px; background:#007acc; color:white; border:none; border-radius:4px; cursor:pointer; }"
+           "input[type=submit]:hover { background:#005f99; }"
+           "</style></head><body><div class='container'>"
+           "<center><h1><strong>SharkShit64</strong></h1></center>"
+           "<center><h3>Wi-Fi Settings</h3></center>"
+           "<form method='POST'>"
+           "SSID:<input type='text' name='ssid' value='%s'><br>"
+           "Password:<input type='password' name='pass' value='%s'><br>"
+           "<input type='submit' value='Save WiFi Credentials'></form>"
+           "<div id='ble-status'>%s</div>"
+           "</div>"
+           "<script>"
+           "function updateBLE() {"
+           "  var xhr = new XMLHttpRequest();"
+           "  xhr.onreadystatechange = function() {"
+           "    if (xhr.readyState == 4 && xhr.status == 200) {"
+           "      document.getElementById('ble-status').innerHTML = xhr.responseText;"
+           "    }"
+           "  };"
+           "  xhr.open('GET', '/ble_status', true);"
+           "  xhr.send();"
+           "}"
+           "setInterval(updateBLE, 5000);"
+           "</script>"
+           "</body></html>",
+           (char *)sta_config.sta.ssid,
+           (char *)sta_config.sta.password,
+           ble_section
+       );
+   } else {
+       html_len = snprintf(html, 4096,
+           "<html><head><style>"
+           "body { background:white; color:black; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; }"
+           ".container { width: 400px; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
+           "input[type=text], input[type=password] { width:100%%; padding:8px; margin:6px 0; box-sizing:border-box; }"
+           "input[type=submit] { width:100%%; padding:10px; background:#007acc; color:white; border:none; border-radius:4px; cursor:pointer; }"
+           "input[type=submit]:hover { background:#005f99; }"
+           "</style></head><body><div class='container'>"
+           "<center><h1><strong>SharkShit64</strong></h1></center>"
+           "<center><h3>Wi-Fi Settings</h3></center>"
+           "<form method='POST'>"
+           "SSID:<input type='text' name='ssid'><br>"
+           "Password:<input type='password' name='pass'><br>"
+           "<input type='submit' value='Save Wifi Credentials'></form>"
+           "<div id='ble-status'>%s</div>"
+           "</div>"
+           "<script>"
+           "function updateBLE() {"
+           "  var xhr = new XMLHttpRequest();"
+           "  xhr.onreadystatechange = function() {"
+           "    if (xhr.readyState == 4 && xhr.status == 200) {"
+           "      document.getElementById('ble-status').innerHTML = xhr.responseText;"
+           "    }"
+           "  };"
+           "  xhr.open('GET', '/ble_status', true);"
+           "  xhr.send();"
+           "}"
+           "setInterval(updateBLE, 5000);"
+           "</script>"
+           "</body></html>",
+           ble_section
+       );
+   }
 
-    if (html_len >= 4096) {
-        ESP_LOGW("CONFIG", "HTML output truncated (%d bytes)", html_len);
-    }
+   if (html_len >= 4096) {
+       ESP_LOGW("CONFIG", "HTML output truncated (%d bytes)", html_len);
+   }
 
-    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+   httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 
-    free(html);
-    free(ble_section);
-    return ESP_OK;
+   free(html);
+   free(ble_section);
+
+   return ESP_OK;
 }
 
 // home_get_handler
 // This handles the GET request from whenever Sharkwire attempts to land on the
 // sharkwireonline.com homepage
 esp_err_t home_get_handler(httpd_req_t *req) {
-    char user_agent[128] = {0};
 
-    // Try to get the User-Agent header from the request
-    if (httpd_req_get_hdr_value_str(req, "User-Agent", user_agent, sizeof(user_agent)) != ESP_OK) {
-        strcpy(user_agent, "Unknown");
+    char *html = malloc(4096);
+    if (!html) {
+        ESP_LOGE("CONFIG", "Memory allocation failed");
+        return ESP_ERR_NO_MEM;
     }
 
-    char html[512];
-    snprintf(html, sizeof(html),
-        "<HTML><BODY>"
-        "<H1>Your User-Agent</H1>"
-        "<P>%s</P>"
-        "<p><a href=\"http://motherfuckingwebsite.com\">TestSite</a></p>"
-        "<p><a href=\"http://theoldnet.com\">TheOldNet</a></p>"
-        "<p><a href=\"http://dc.dreamcastlive.net/chat.php\">Chat</a></p>"
-        "</BODY></HTML>",
-        user_agent);
+    snprintf(html, 4096,
+        "<!DOCTYPE html>"
+        "<html>"
+        "<head>"
+        "<title>SharkWire Online</title>"
+        "</head>"
+        "<frameset cols=\"25%%,75%%\">"
+        "<frame src=\"menu.htm\" name=\"menu\">"
+        "<frame src=\"content.htm\" name=\"content\">"
+        "</frameset>"
+        "</html>"
+    );
+
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+
+    free(html);
+    return ESP_OK;
+}
+
+esp_err_t menu_get_handler(httpd_req_t *req) {
+    const char *html =
+        "<html><head><title>SharkWire Online</title></head>"
+        "<body bgcolor=\"#000099\" text=\"#E0E040\" link=\"#FFCC00\" vlink=\"#FFCC00\" alink=\"#FFCC00\">"
+        "<body background=\"file:///c:/dm/shrkimg/all_w_xx_circles.gif\">"
+        "<img src=\"file:///c:/dm/shrkimg/all_l_xx_logo.gif\" border=\"0\" vspace=\"0\" hspace=\"0\">"
+
+        "<a href=\"http://gamegenie.com/cheats/gameshark/n64/index.html\" target=\"content\">"
+        "<img src=\"file:///c:/dm/shrkimg/gmr_n_xx.gif\" border=\"0\" vspace=\"2\" hspace=\"2\"></a>"
+
+        "<a href=\"http://68k.news\" target=\"content\">"
+        "<img src=\"file:///c:/dm/shrkimg/klt_n_xx.gif\" border=\"0\" vspace=\"2\" hspace=\"2\"></a>"
+
+        "</body></html>";
+
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+esp_err_t content_get_handler(httpd_req_t *req) {
+    const char *html =
+        "<html><title>SharkWire Online</title>"
+        "<body bgcolor=\"#000099\" text=\"#E0E040\" link=\"#FFCC00\" vlink=\"#FFCC00\" alink=\"#FFCC00\">"
+        "<h1>Welcome to Sharkwire Online</h1>"
+        "</body></html>";
 
     httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -662,7 +928,9 @@ void http_ui_task(void *arg) {
     ESP_LOGI(HTTP_UI_TAG, "http_ui started on core %d", xPortGetCoreID());
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10;
+    config.uri_match_fn = httpd_uri_match_wildcard;
+    config.stack_size = 16384;
+    config.max_uri_handlers = 16;
 
     httpd_handle_t server = NULL;
     httpd_start(&server, &config);
@@ -714,8 +982,30 @@ void http_ui_task(void *arg) {
         .method = HTTP_GET,
         .handler = ble_status_get_handler,
     };
-
     httpd_register_uri_handler(server, &ble_status_uri);
+
+    httpd_uri_t menu_uri = {
+        .uri = "/swo/menu.htm",
+        .method = HTTP_GET,
+        .handler = menu_get_handler,
+    };
+    httpd_register_uri_handler(server, &menu_uri);
+
+    httpd_uri_t content_uri = {
+        .uri = "/swo/content.htm",
+        .method = HTTP_GET,
+        .handler = content_get_handler,
+    };
+    httpd_register_uri_handler(server, &content_uri);
+
+    httpd_uri_t gamegenie_handler = {
+       .uri      = "/cheats/gameshark/n64/*",
+       .method   = HTTP_GET,
+       .handler  = gamegenie_proxy_handler,
+       .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(server, &gamegenie_handler);
+
     // Register URI handlers
     if (httpd_register_uri_handler(server, &config_get_uri) != ESP_OK) {
         ESP_LOGE(HTTP_UI_TAG, "Failed to register config page GET handler");

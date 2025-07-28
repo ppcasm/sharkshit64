@@ -98,7 +98,7 @@ void dns_task(void *arg) {
         ESP_LOGI(DNS_TAG, "DNS Query for: %s", name);
 
         // Check if the domain matches our special case
-        if ((strcasecmp(name, "www.sharkwireonline.com") == 0) || (strcasecmp(name, "mail.sharkwire.com") == 0)) {
+        if ((strcasecmp(name, "gamegenie.com") == 0) || (strcasecmp(name, "www.sharkwireonline.com") == 0) || (strcasecmp(name, "mail.sharkwire.com") == 0)) {
 
             // Build the response for things we want to resolve locally, like activation or home trap
             ESP_LOGI(DNS_TAG, "Custom DNS map");
