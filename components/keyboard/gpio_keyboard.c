@@ -24,22 +24,22 @@ volatile uint8_t kb_tail = 0;
 // even if delayed. This simply fills the keyboard buffer which will be handled accordingly in
 // our clk_isr_handler
 void queue_scancode(uint8_t scancode) {
-    uint8_t next_head = (kb_head + 1) % KB_BUFFER_SIZE;
-    if (next_head == kb_tail) {
-        ESP_LOGW(GPIO_KEYBOARD_TAG, "KB buffer overflow, dropping scancode");
-        return;
-    }
+   uint8_t next_head = (kb_head + 1) % KB_BUFFER_SIZE;
+   if (next_head == kb_tail) {
+       ESP_LOGW(GPIO_KEYBOARD_TAG, "KB buffer overflow, dropping scancode");
+       return;
+   }
 
-    kb_buffer[kb_head] = scancode;
-    kb_head = next_head;
+   kb_buffer[kb_head] = scancode;
+   kb_head = next_head;
 
-    // If we're idle, kickstart the transmission immediately
-    if (kb_state == 0) {
-        kb_scancode = kb_buffer[kb_tail];
-        kb_tail = (kb_tail + 1) % KB_BUFFER_SIZE;
-        gpio_set_level(MCU_TO_N64_KB_DATA, 1); // SYNC bit
-        kb_state = 1;
-    }
+   // If we're idle, kickstart the transmission immediately
+   if (kb_state == 0) {
+       kb_scancode = kb_buffer[kb_tail];
+       kb_tail = (kb_tail + 1) % KB_BUFFER_SIZE;
+       gpio_set_level(MCU_TO_N64_KB_DATA, 1); // SYNC bit
+       kb_state = 1;
+   }
 }
 
 // clk_isr_handler
@@ -62,76 +62,75 @@ void queue_scancode(uint8_t scancode) {
 // All signals are FALLING edge triggered, and the CLK signal is set up to run this function every
 // time CLK goes low which cuts down on CPU waste by not having to poll.
 void IRAM_ATTR clk_isr_handler(void* arg) {
-    switch (kb_state) {
-        case 1: // Send start bit
-            gpio_set_level(MCU_TO_N64_KB_DATA, 0);
-            kb_state = 2;
-            kb_bit_index = 0;
-            break;
+   switch (kb_state) {
+       case 1: // Send start bit
+           gpio_set_level(MCU_TO_N64_KB_DATA, 0);
+           kb_state = 2;
+           kb_bit_index = 0;
+           break;
 
-        case 2: // Send scancode bits LSB first
-            gpio_set_level(MCU_TO_N64_KB_DATA, (kb_scancode >> kb_bit_index) & 1);
-            kb_bit_index++;
-            if (kb_bit_index >= 8) {
-                kb_state = 3;
-            }
-            break;
+       case 2: // Send scancode bits LSB first
+           gpio_set_level(MCU_TO_N64_KB_DATA, (kb_scancode >> kb_bit_index) & 1);
+           kb_bit_index++;
+           if (kb_bit_index >= 8) {
+               kb_state = 3;
+           }
+           break;
 
-        case 3: // Send stop bit
-            gpio_set_level(MCU_TO_N64_KB_DATA, 1);
-            kb_state = 4;
-            break;
+       case 3: // Send stop bit
+           gpio_set_level(MCU_TO_N64_KB_DATA, 1);
+           kb_state = 4;
+           break;
 
-        case 4: // Return to idle (DATA=0)
-            gpio_set_level(MCU_TO_N64_KB_DATA, 0);
-            kb_state = 0;
+       case 4: // Return to idle (DATA=0)
+           gpio_set_level(MCU_TO_N64_KB_DATA, 0);
+           kb_state = 0;
 
-            // Check if more scancodes queued
-            if (kb_head != kb_tail) {
-                kb_scancode = kb_buffer[kb_tail];
-                kb_tail = (kb_tail + 1) % KB_BUFFER_SIZE;
+           // Check if more scancodes queued
+           if (kb_head != kb_tail) {
+               kb_scancode = kb_buffer[kb_tail];
+               kb_tail = (kb_tail + 1) % KB_BUFFER_SIZE;
 
-                // Immediately start new transmission
-                gpio_set_level(MCU_TO_N64_KB_DATA, 1);
-                kb_state = 1;
-            }
-            break;
+               // Immediately start new transmission
+               gpio_set_level(MCU_TO_N64_KB_DATA, 1);
+               kb_state = 1;
+           }
+           break;
 
-        default:
-            break;
-    }
+       default:
+           break;
+   }
 }
 
 // init_gpio_keyboard
 // This sets up the GPIO pin configuration for the GPIO side of the sharkwire keyboard interface
 void init_gpio_keyboard() {
-    ESP_LOGI(GPIO_KEYBOARD_TAG, "GPIO_Keyboard Initialized");
+   ESP_LOGI(GPIO_KEYBOARD_TAG, "GPIO_Keyboard Initialized");
 
-    // DATA pin as output
-    gpio_config_t data_conf = {
-        .pin_bit_mask = (1ULL << MCU_TO_N64_KB_DATA),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = 0,
-        .pull_down_en = 0,
-        .intr_type = GPIO_INTR_DISABLE
-    };
-    gpio_config(&data_conf);
+   // DATA pin as output
+   gpio_config_t data_conf = {
+       .pin_bit_mask = (1ULL << MCU_TO_N64_KB_DATA),
+       .mode = GPIO_MODE_OUTPUT,
+       .pull_up_en = 0,
+       .pull_down_en = 0,
+       .intr_type = GPIO_INTR_DISABLE
+   };
+   gpio_config(&data_conf);
 
-    // CLK pin as input with interrupt on FALLING edge
-    gpio_config_t clk_conf = {
-        .pin_bit_mask = (1ULL << MCU_TO_N64_KB_CLK),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = 0,
-        .pull_down_en = 1,
-        .intr_type = GPIO_INTR_NEGEDGE
-    };
+   // CLK pin as input with interrupt on FALLING edge
+   gpio_config_t clk_conf = {
+       .pin_bit_mask = (1ULL << MCU_TO_N64_KB_CLK),
+       .mode = GPIO_MODE_INPUT,
+       .pull_up_en = 0,
+       .pull_down_en = 1,
+       .intr_type = GPIO_INTR_NEGEDGE
+   };
 
-    gpio_config(&clk_conf);
+   gpio_config(&clk_conf);
 
-    gpio_install_isr_service(0);
-    gpio_isr_handler_add(MCU_TO_N64_KB_CLK, clk_isr_handler, NULL);
+   gpio_install_isr_service(0);
+   gpio_isr_handler_add(MCU_TO_N64_KB_CLK, clk_isr_handler, NULL);
 
-    // Set initial DATA level (idle = low)
-    gpio_set_level(MCU_TO_N64_KB_DATA, 0);
-
+   // Set initial DATA level (idle = low)
+   gpio_set_level(MCU_TO_N64_KB_DATA, 0);
  }
