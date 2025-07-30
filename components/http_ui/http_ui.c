@@ -34,8 +34,10 @@ typedef struct {
 
 // Used for HTTP email handlers, as well as NVS access
 typedef struct {
-    char server[128];
-    char port[16];
+    char smtp_server[128];
+    char smtp_port[16];
+    char imap_server[128];
+    char imap_port[16];
     char username[128];
     char password[128];
 } email_credentials_t;
@@ -99,8 +101,12 @@ const char *get_post_value(const char *key, FormField *fields, int field_count) 
 // before it'll attempt to set values. This encoding is based off of the remote IP
 // address, which would be known server side and passed in as a response with proper
 // formatting. This is the encode portion of that action.  
-static char *sharkwire_encode(const char *tag, const char *ip) {
+static char *sharkwire_encode(const char *tag) {
    // We used the power of jhynjhiruu to figure this shit out :p 
+
+   // Get remote IP to use as key for specialized tag encoding
+   const char *ip = ip4addr_ntoa(netif_ip4_gw(&ppp_netif));
+
    size_t tag_len = strlen(tag);
    size_t ip_len = strlen(ip);
    size_t out_len = tag_len * 2;
@@ -157,13 +163,17 @@ void save_email_credentials(const email_credentials_t *creds) {
        return;
    }
 
-   url_decode((char *)creds->server);
-   url_decode((char *)creds->port);
+   url_decode((char *)creds->smtp_server);
+   url_decode((char *)creds->smtp_port);
+   url_decode((char *)creds->imap_server);
+   url_decode((char *)creds->imap_port);
    url_decode((char *)creds->username);
    url_decode((char *)creds->password);
 
-   nvs_set_str(handle, "server", creds->server);
-   nvs_set_str(handle, "port", creds->port);
+   nvs_set_str(handle, "smtp_server", creds->smtp_server);
+   nvs_set_str(handle, "smtp_port", creds->smtp_port);
+   nvs_set_str(handle, "imap_server", creds->imap_server);
+   nvs_set_str(handle, "imap_port", creds->imap_port);
    nvs_set_str(handle, "username", creds->username);
    nvs_set_str(handle, "password", creds->password);
 
@@ -184,11 +194,17 @@ bool load_email_credentials(email_credentials_t *email_credentials) {
        return false;
    }
 
-   size = sizeof(email_credentials->server);
-   if (nvs_get_str(handle, "server", email_credentials->server, &size) != ESP_OK) goto fail;
+   size = sizeof(email_credentials->smtp_server);
+   if (nvs_get_str(handle, "smtp_server", email_credentials->smtp_server, &size) != ESP_OK) goto fail;
 
-   size = sizeof(email_credentials->port);
-   if (nvs_get_str(handle, "port", email_credentials->port, &size) != ESP_OK) goto fail;
+   size = sizeof(email_credentials->smtp_port);
+   if (nvs_get_str(handle, "smtp_port", email_credentials->smtp_port, &size) != ESP_OK) goto fail;
+
+   size = sizeof(email_credentials->imap_server);
+   if (nvs_get_str(handle, "imap_server", email_credentials->imap_server, &size) != ESP_OK) goto fail;
+
+   size = sizeof(email_credentials->imap_port);
+   if (nvs_get_str(handle, "imap_port", email_credentials->imap_port, &size) != ESP_OK) goto fail;
 
    size = sizeof(email_credentials->username);
    if (nvs_get_str(handle, "username", email_credentials->username, &size) != ESP_OK) goto fail;
@@ -225,13 +241,29 @@ esp_err_t config_post_handler(httpd_req_t *req) {
 
    // Save WiFi Credentials
    if ((req->method == HTTP_POST) && strcmp(req->uri, "/save_wifi") == 0) {
-       char buf[128];
-       int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
-       if (len <= 0) return ESP_FAIL;
-       buf[len] = 0;
+       char wifi_cred_buf[256];
+       int total_len = req->content_len;
+       if (total_len >= sizeof(wifi_cred_buf)) return ESP_FAIL;
 
-       char ssid[32] = {0}, pass[64] = {0};
-       sscanf(buf, "ssid=%31[^&]&pass=%63s", ssid, pass);
+       int received = 0;
+       while (received < total_len) {
+           int ret = httpd_req_recv(req, wifi_cred_buf + received, total_len - received);
+           if (ret <= 0) return ESP_FAIL;
+           received += ret;
+       }
+       wifi_cred_buf[received] = '\0';
+
+       FormField fields[10];
+       int field_count = 0;
+       parse_post_data(wifi_cred_buf, fields, &field_count);
+
+       const char *ssid = "";
+       const char *pass = "";
+       for (int i = 0; i < field_count; i++) {
+           if (strcmp(fields[i].key, "ssid") == 0) ssid = fields[i].value;
+           if (strcmp(fields[i].key, "pass") == 0) pass = fields[i].value;
+       }
+
        save_sta_credentials(ssid, pass);
 
        httpd_resp_send(req,
@@ -244,18 +276,39 @@ esp_err_t config_post_handler(httpd_req_t *req) {
        return ESP_OK;
    }
 
-   // Save Email SMTP Settings
+   // Save Email SMTP/IMAP/User Settings
    if ((req->method == HTTP_POST) && strcmp(req->uri, "/save_email") == 0) {
-       char buf[256];
-       int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+       char email_cred_buf[256];
+       int len = httpd_req_recv(req, email_cred_buf, sizeof(email_cred_buf) - 1);
        if (len <= 0) return ESP_FAIL;
-       buf[len] = 0;
+       email_cred_buf[len] = '\0';
+
+       // Parse into key/value pairs
+       FormField fields[10];
+       int field_count;
+       parse_post_data(email_cred_buf, fields, &field_count);
 
        email_credentials_t creds = {0};
 
-       sscanf(buf,
-           "server=%63[^&]&port=%7[^&]&username=%63[^&]&password=%63s",
-           creds.server, creds.port, creds.username, creds.password);
+       // Get each field by key
+       const char *val;
+       if ((val = get_post_value("smtp_server", fields, field_count)))
+           strncpy(creds.smtp_server, val, sizeof(creds.smtp_server) - 1);
+
+       if ((val = get_post_value("smtp_port", fields, field_count)))
+           strncpy(creds.smtp_port, val, sizeof(creds.smtp_port) - 1);
+
+       if ((val = get_post_value("imap_server", fields, field_count)))
+           strncpy(creds.imap_server, val, sizeof(creds.imap_server) - 1);
+
+       if ((val = get_post_value("imap_port", fields, field_count)))
+           strncpy(creds.imap_port, val, sizeof(creds.imap_port) - 1);
+
+       if ((val = get_post_value("username", fields, field_count)))
+           strncpy(creds.username, val, sizeof(creds.username) - 1);
+
+       if ((val = get_post_value("password", fields, field_count)))
+           strncpy(creds.password, val, sizeof(creds.password) - 1);
 
        save_email_credentials(&creds);
 
@@ -551,6 +604,32 @@ esp_err_t gamegenie_proxy_handler(httpd_req_t *req) {
    return ESP_OK;
 }
 
+// escape_html
+// This escapes HTML special characters for safe display
+static void escape_html(const char *src, char *dst, size_t dst_size) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 1 < dst_size; i++) {
+        char c = src[i];
+        const char *rep = NULL;
+        switch (c) {
+            case '&':  rep = "&amp;";  break;
+            case '<':  rep = "&lt;";   break;
+            case '>':  rep = "&gt;";   break;
+            case '"':  rep = "&quot;"; break;
+            case '\'': rep = "&#39;";  break;
+            default: dst[j++] = c; continue;
+        }
+        size_t rep_len = strlen(rep);
+        if (j + rep_len < dst_size) {
+            memcpy(&dst[j], rep, rep_len);
+            j += rep_len;
+        } else {
+            break; // Prevent overflow
+        }
+    }
+    dst[j] = '\0';
+}
+
 // config_get_handler
 // This handles the GET request of the config WiFi and EMAIL credentials setup page that displays at 192.168.4.1
 // when you connect to the ESP32 SSID while its AP is running, and it also shows the current bonded
@@ -560,28 +639,39 @@ esp_err_t config_get_handler(httpd_req_t *req) {
    email_credentials_t email_config = {0};
 
    char *html = malloc(8192);
-   if (!html) {
-       ESP_LOGE("CONFIG", "Memory allocation failed");
+   char *ble_section = malloc(1024);
+   if (!html || !ble_section) {
+       ESP_LOGE(HTTP_UI_TAG, "Memory allocation failed");
+       free(html);
+       free(ble_section);
        return ESP_ERR_NO_MEM;
    }
 
    bool has_sta   = load_sta_credentials(&sta_config);
    bool has_email = load_email_credentials(&email_config);
 
-   // Ensure null termination of NVS params
+   // Ensure null-termination
    sta_config.sta.ssid[sizeof(sta_config.sta.ssid) - 1] = 0;
    sta_config.sta.password[sizeof(sta_config.sta.password) - 1] = 0;
-   email_config.server[sizeof(email_config.server) - 1] = 0;
-   email_config.port[sizeof(email_config.port) - 1] = 0;
+   email_config.smtp_server[sizeof(email_config.smtp_server) - 1] = 0;
+   email_config.smtp_port[sizeof(email_config.smtp_port) - 1] = 0;
+   email_config.imap_server[sizeof(email_config.imap_server) - 1] = 0;
+   email_config.imap_port[sizeof(email_config.imap_port) - 1] = 0;
    email_config.username[sizeof(email_config.username) - 1] = 0;
    email_config.password[sizeof(email_config.password) - 1] = 0;
 
-   char *ble_section = malloc(512);
-   if (!ble_section) {
-       free(html);
-       ESP_LOGE("CONFIG", "Memory allocation failed");
-       return ESP_ERR_NO_MEM;
-   }
+   // Escape HTML values to prevent injection
+   char esc_ssid[64], esc_pass[64], esc_smtp[64], esc_smtp_port[16];
+   char esc_imap[64], esc_imap_port[16], esc_user[64], esc_email_pass[64];
+
+   escape_html((char*)sta_config.sta.ssid,     esc_ssid, sizeof(esc_ssid));
+   escape_html((char*)sta_config.sta.password, esc_pass, sizeof(esc_pass));
+   escape_html(email_config.smtp_server,       esc_smtp, sizeof(esc_smtp));
+   escape_html(email_config.smtp_port,         esc_smtp_port, sizeof(esc_smtp_port));
+   escape_html(email_config.imap_server,       esc_imap, sizeof(esc_imap));
+   escape_html(email_config.imap_port,         esc_imap_port, sizeof(esc_imap_port));
+   escape_html(email_config.username,          esc_user, sizeof(esc_user));
+   escape_html(email_config.password,          esc_email_pass, sizeof(esc_email_pass));
 
    // BLE status section
    char bda_str[64] = "N/A";
@@ -605,7 +695,7 @@ esp_err_t config_get_handler(httpd_req_t *req) {
                 "<strong><p style=\"color:red;\">Power cycle the Nintendo64 to finalize BLE bonding</p></strong>");
    }
 
-   snprintf(ble_section, 512,
+   snprintf(ble_section, 1024,
        "<center><h3>BLE Status</h3></center>"
        "<p>Bonded Device: %s</p>"
        "<p>Connected: %s</p>"
@@ -622,19 +712,21 @@ esp_err_t config_get_handler(httpd_req_t *req) {
        restart_n64_msg
    );
 
-   // Build page
+   // Main HTML
    int html_len = snprintf(html, 8192,
        "<html><head><style>"
-       "body { background:white; color:black; font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; }"
-       ".container { width: 400px; padding:20px; border:1px solid #ccc; border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
+       "body { background:white; color:black; font-family:sans-serif; margin:0; padding:20px; }"
+       ".container { width: 400px; margin:0 auto; padding:20px; border:1px solid #ccc; "
+       "border-radius:8px; box-shadow:2px 2px 12px rgba(0,0,0,0.1); }"
        "input[type=text], input[type=password] { width:100%%; padding:8px; margin:6px 0; box-sizing:border-box; }"
        "input[type=submit] { width:100%%; padding:10px; background:#007acc; color:white; border:none; border-radius:4px; cursor:pointer; }"
        "input[type=submit]:hover { background:#005f99; }"
        "h3 { margin-top: 20px; }"
-       "</style></head><body><div class='container'>"
+       "</style></head><body>"
+       "<div class='container'>"
        "<center><h1><strong>SharkShit64</strong></h1></center>"
 
-       // Wi-Fi form
+       // Wi-Fi
        "<center><h3>Wi-Fi Settings</h3></center>"
        "<form method='POST' action='/save_wifi'>"
        "SSID:<input type='text' name='ssid' value='%s'><br>"
@@ -642,17 +734,21 @@ esp_err_t config_get_handler(httpd_req_t *req) {
        "<input type='submit' value='Save WiFi Credentials'>"
        "</form>"
 
-       // Email form
+       // Email
        "<center><h3>Email (SMTP) Settings</h3></center>"
        "<form method='POST' action='/save_email'>"
-       "SMTP Server:<input type='text' name='server' value='%s'><br>"
-       "Port:<input type='text' name='port' value='%s'><br>"
+       "SMTP Server:<input type='text' name='smtp_server' value='%s'><br>"
+       "SMTP Port:<input type='text' name='smtp_port' value='%s'><br>"
+       "<center><h3>Email (IMAP) Settings</h3></center>"
+       "IMAP Server:<input type='text' name='imap_server' value='%s'><br>"
+       "IMAP Port:<input type='text' name='imap_port' value='%s'><br>"
+       "<center><h3>Email Credentials</h3></center>"
        "Username:<input type='text' name='username' value='%s'><br>"
        "Password:<input type='password' name='password' value='%s'><br>"
-       "<input type='submit' value='Save Email Credentials'>"
+       "<input type='submit' value='Save Email Settings'>"
        "</form>"
 
-       "<div id='ble-status'>%s</div>"
+       "%s"
        "</div>"
 
        "<script>"
@@ -670,20 +766,25 @@ esp_err_t config_get_handler(httpd_req_t *req) {
        "</script>"
        "</body></html>",
 
-       has_sta   ? (char *)sta_config.sta.ssid     : "",
-       has_sta   ? (char *)sta_config.sta.password : "",
-       has_email ? email_config.server             : "",
-       has_email ? email_config.port               : "",
-       has_email ? email_config.username           : "",
-       has_email ? email_config.password           : "",
+       has_sta   ? esc_ssid     : "",
+       has_sta   ? esc_pass     : "",
+       has_email ? esc_smtp     : "",
+       has_email ? esc_smtp_port: "",
+       has_email ? esc_imap     : "",
+       has_email ? esc_imap_port: "",
+       has_email ? esc_user     : "",
+       has_email ? esc_email_pass: "",
        ble_section
    );
 
-   if (html_len >= 8192) {
-       ESP_LOGW("CONFIG", "HTML output truncated (%d bytes)", html_len);
+   if (html_len < 0 || html_len >= 8192) {
+       ESP_LOGE(HTTP_UI_TAG, "HTML output truncated");
+       free(html);
+       free(ble_section);
+       return ESP_FAIL;
    }
 
-   httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+   httpd_resp_send(req, html, html_len);
 
    free(html);
    free(ble_section);
@@ -842,16 +943,15 @@ esp_err_t activation_handler(httpd_req_t *req) {
    }
 
    if ((req->method == HTTP_POST || req->method == HTTP_GET) && strcmp(req->uri, "/cgi-bin/netshark/act_1") == 0) {
-
-   const char *ip = ip4addr_ntoa(netif_ip4_gw(&ppp_netif));
-   char *new_user_ok_encoded = sharkwire_encode("NEW_USER_OK", ip);
+   
+   char *new_user_ok_encoded = sharkwire_encode("NEW_USER_OK");
 
    if (!new_user_ok_encoded) {
        httpd_resp_send(req, "Error encoding tag", HTTPD_RESP_USE_STRLEN);
        return ESP_FAIL;
    }
 
-   char *cangoto_yes_encoded = sharkwire_encode("YES", ip);
+   char *cangoto_yes_encoded = sharkwire_encode("YES");
 
    if (!cangoto_yes_encoded) {
        httpd_resp_send(req, "Error encoding tag", HTTPD_RESP_USE_STRLEN);
@@ -982,11 +1082,10 @@ esp_err_t newuserform_handler(httpd_req_t *req) {
        const char *username_tag = username1;
        const char *password_tag = password1;
 
-       const char *ip = ip4addr_ntoa(netif_ip4_gw(&ppp_netif));
-       char *username_encoded = sharkwire_encode(username_tag, ip);
-       char *password_encoded = sharkwire_encode(password_tag, ip);
-       char *new_user_ok_encoded = sharkwire_encode("NEW_USER_OK", ip);
-       char *cangoto_yes_encoded = sharkwire_encode("YES", ip);
+       char *username_encoded = sharkwire_encode(username_tag);
+       char *password_encoded = sharkwire_encode(password_tag);
+       char *new_user_ok_encoded = sharkwire_encode("NEW_USER_OK");
+       char *cangoto_yes_encoded = sharkwire_encode("YES");
 
        if (!username_encoded || !password_encoded || !new_user_ok_encoded || !cangoto_yes_encoded) {
            httpd_resp_send(req, "Error encoding username, password, or new_user_ok tag", HTTPD_RESP_USE_STRLEN);
@@ -1031,8 +1130,9 @@ esp_err_t newuserform_handler(httpd_req_t *req) {
    return ESP_OK;
 }
 
+// base64_encode
+// This is used to do base64 encoding for the ESP32 side of the email handling
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 static void base64_encode(const char *in, char *out) {
    int i = 0, j = 0, len = strlen(in);
    while (len--) {
@@ -1060,6 +1160,31 @@ static void base64_encode(const char *in, char *out) {
    out[j] = '\0';
 }
 
+// imap_send
+// Used to send IMAP commands to the configured IMAP email server connection
+static int imap_send(esp_tls_t *tls, const char *cmd) {
+    int len = strlen(cmd);
+    int ret = esp_tls_conn_write(tls, cmd, len);
+    if (ret < 0) {
+        ESP_LOGE(EMAIL_TAG, "Send failed");
+        return -1;
+    }
+    return ret;
+}
+
+// imap_recv
+// Used to recv IMAP return data from the configured IMAP email server connection
+static int imap_recv(esp_tls_t *tls, char *buf, size_t buf_len) {
+    int ret = esp_tls_conn_read(tls, buf, buf_len - 1);
+    if (ret >= 0) {
+        buf[ret] = '\0';
+        return ret;
+    }
+    return -1;
+}
+
+// smtp_cmd
+// Used to send SMTP commands to the configured SMTP server connection
 static esp_err_t smtp_cmd(esp_tls_t *tls, const char *cmd, const char *expect) {
    char buf[512];
    if (cmd) {
@@ -1075,6 +1200,8 @@ static esp_err_t smtp_cmd(esp_tls_t *tls, const char *cmd, const char *expect) {
    return ESP_OK;
 }
 
+// smtp_send_email
+// Used to send outbound email via SMTP connection (for offline email from menu)
 esp_err_t smtp_send_email(const char *from_email, const char *password,
                          const char *to_email, const char *subject,
                          const char *body) {
@@ -1096,16 +1223,18 @@ esp_err_t smtp_send_email(const char *from_email, const char *password,
    }
 
    // Null terminate NVS values
-   email_cfg.server[sizeof(email_cfg.server) - 1] = '\0';
-   email_cfg.port[sizeof(email_cfg.port) - 1] = '\0';
+   email_cfg.smtp_server[sizeof(email_cfg.smtp_server) - 1] = '\0';
+   email_cfg.smtp_port[sizeof(email_cfg.smtp_port) - 1] = '\0';
+   email_cfg.imap_server[sizeof(email_cfg.imap_server) - 1] = '\0';
+   email_cfg.imap_port[sizeof(email_cfg.imap_port) - 1] = '\0';
    email_cfg.username[sizeof(email_cfg.username) - 1] = '\0';
    email_cfg.password[sizeof(email_cfg.password) - 1] = '\0';
 
    // Convert port from string to int
-   int port_num = atoi(email_cfg.port);
-   if (port_num <= 0) port_num = 465; // fallback
+   int smtp_port_num = atoi(email_cfg.smtp_port);
+   if (smtp_port_num <= 0) smtp_port_num = 465; // fallback SMTP port
 
-   if (esp_tls_conn_new_sync(email_cfg.server, strlen(email_cfg.server), port_num, &cfg, tls) <= 0) {
+   if (esp_tls_conn_new_sync(email_cfg.smtp_server, strlen(email_cfg.smtp_server), smtp_port_num, &cfg, tls) <= 0) {
        ESP_LOGE(EMAIL_TAG, "TLS connection failed");
        esp_tls_conn_destroy(tls);
        return ESP_FAIL;
@@ -1143,6 +1272,7 @@ esp_err_t smtp_send_email(const char *from_email, const char *password,
       "%s\r\n"
       ".\r\n",
       from_email, to_email, subject, body);
+
    smtp_cmd(tls, cmd, "250");
 
    smtp_cmd(tls, "QUIT\r\n", "221");
@@ -1153,21 +1283,61 @@ esp_err_t smtp_send_email(const char *from_email, const char *password,
 }
 
 // email_send_get_handler
+// I don't think this is called from any of the menu selections, so just debug output for now
 static esp_err_t email_send_get_handler(httpd_req_t *req) {
-   ESP_LOGI(HTTP_UI_TAG, "Received GET request: URI = %s", req->uri);
 
-   // Print headers
-   char header_val[100];
-   if (httpd_req_get_hdr_value_str(req, "User-Agent", header_val, sizeof(header_val)) == ESP_OK) {
-       ESP_LOGI(HTTP_UI_TAG, "User-Agent: %s", header_val);
-   }
+    ESP_LOGI(HTTP_UI_TAG, "URI: %s", req->uri);
 
-   const char *resp_str = "Hello from ESP32 GET!";
-   httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
-   return ESP_OK;
+    char header_val[256];
+    const char *headers[] = {
+        "Host", "User-Agent", "Accept", "Accept-Encoding",
+        "Accept-Language", "Connection", "Referer"
+    };
+
+    for (int i = 0; i < sizeof(headers) / sizeof(headers[0]); i++) {
+        if (httpd_req_get_hdr_value_str(req, headers[i], header_val, sizeof(header_val)) == ESP_OK) {
+            ESP_LOGI(HTTP_UI_TAG, "%s: %s", headers[i], header_val);
+        }
+    }
+
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) { // Query string exists
+        char *qry_str = malloc(buf_len);
+        if (qry_str) {
+            if (httpd_req_get_url_query_str(req, qry_str, buf_len) == ESP_OK) {
+                ESP_LOGI(HTTP_UI_TAG, "Query String: %s", qry_str);
+
+                char param_val[100];
+                if (httpd_query_key_value(qry_str, "name", param_val, sizeof(param_val)) == ESP_OK) {
+                    ESP_LOGI(HTTP_UI_TAG, "Query Param 'name' = %s", param_val);
+                }
+            }
+            free(qry_str);
+        }
+    }
+
+    buf_len = req->content_len;
+    if (buf_len > 0) {
+        char *body = malloc(buf_len + 1);
+        if (body) {
+            int ret = httpd_req_recv(req, body, buf_len);
+            if (ret > 0) {
+                body[ret] = '\0';
+                ESP_LOGI(HTTP_UI_TAG, "Body: %s", body);
+            }
+            free(body);
+        }
+    }
+
+    const char *resp_str = "email_send_get_handler was called";
+    httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+
+    return ESP_OK;
+
 }
 
 // email_send_post_handler
+// This is the handler for the offline email sender (from the main menu)
 static esp_err_t email_send_post_handler(httpd_req_t *req) {
    ESP_LOGI(HTTP_UI_TAG, "Request: %s %s",
        (req->method == HTTP_GET) ? "GET" :
@@ -1220,18 +1390,70 @@ static esp_err_t email_send_post_handler(httpd_req_t *req) {
 
    if (!load_email_credentials(&email_cfg)) {
        ESP_LOGE(EMAIL_TAG, "No email credentials saved in NVS");
+
+       const char *email_id_str = EMAIL_ID;
+
+       // Build full DEMailID string
+       char demailid_buf[256];
+       snprintf(demailid_buf, sizeof(demailid_buf), "DEMailID=%s", email_id_str);
+
+       // Encode full DEMailID string with SharkWire's encoding
+       char *emailsendfailure_encoded = sharkwire_encode(demailid_buf);
+
+       // This is the HTML that dequeues the outbox and tells sharkwire that the email has
+       // successfully sent
+       char *resp = NULL;
+
+       asprintf(&resp,
+           "<html>\n"
+           "<head>\n"
+           "<title>SharkWire Online Email Error</title>\n"
+           "<STYLE TYPE=\"text/css\">\n"
+           "</STYLE>\n"
+           "<meta name=\"SHARKWIRE_MAGIC\" content=\"D64A2756_SW_FE62\">\n"
+           "<meta name=\"TARGETRES\" content=\"640x240\">\n"
+           "<meta name=\"SHARKWIRE_EMAILSENDFAILURE\" content=\"%s\">\n"
+           "<meta name=\"SHARKWIRE_LASTTAG\" content=\"\">\n"
+           "</head>\n"
+           "<body bgCOLOR=\"#000099\" text=\"#FFFFCC\">\n"
+           "<br clear=all>\n"
+           "<input type =\"hidden\" Name=\"DEmailId\" Value=\"%s\">\n"
+           "<center><img src=\"file:///c:/dm/shrkimg/all_l_gr_sharkwire.gif\" alt=\"Interact\" width=\"360\" height=\"60\" vspace=\"4\" border=\"0\" align=\"top\">\n"
+           "<p align=\"center\">Your message was NOT SENT!<br><br>Please setup WiFi and Email credentials by logging into the ESP32 configuration UI</a>\n"
+           "</p>\n"
+           "</body>\n"
+           "</html>\n",
+           emailsendfailure_encoded,   // Encoded DEMailID for meta tag
+           emailsendfailure_encoded    // Encoded DEMailID for hidden form
+       );
+
+       if (!resp) {
+           free(emailsendfailure_encoded);
+           free(fields);
+           free(post_buf);
+           httpd_resp_send(req, "<html><body><center>Error in response</center></body></html>", HTTPD_RESP_USE_STRLEN);
+           return ESP_FAIL;
+       }
+
+       httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+       free(emailsendfailure_encoded);
+       free(fields);
+       free(post_buf);
+
        return ESP_FAIL;
    }
 
    // Null terminate NVS values
-   email_cfg.server[sizeof(email_cfg.server) - 1] = '\0';
-   email_cfg.port[sizeof(email_cfg.port) - 1] = '\0';
+   email_cfg.smtp_server[sizeof(email_cfg.smtp_server) - 1] = '\0';
+   email_cfg.smtp_port[sizeof(email_cfg.smtp_port) - 1] = '\0';
+   email_cfg.imap_server[sizeof(email_cfg.imap_server) - 1] = '\0';
+   email_cfg.imap_port[sizeof(email_cfg.imap_port) - 1] = '\0';
    email_cfg.username[sizeof(email_cfg.username) - 1] = '\0';
    email_cfg.password[sizeof(email_cfg.password) - 1] = '\0';
 
-   // Convert port from string to int
-   int port_num = atoi(email_cfg.port);
-   if (port_num <= 0) port_num = 465; // fallback
+   // Convert SMTP port from string to int
+   int smtp_port_num = atoi(email_cfg.smtp_port);
+   if (smtp_port_num <= 0) smtp_port_num = 465; // fallback SMTP port
 
    // Sharkwire seems to place a "," at the end of the TO string, so let's patch that for now
    if (EMAIL_TO && EMAIL_TO[0]) {
@@ -1256,19 +1478,21 @@ static esp_err_t email_send_post_handler(httpd_req_t *req) {
    if (res == ESP_OK) {
        ESP_LOGI(EMAIL_TAG, "Email sent successfully!");
 
+       // When the ESP32 side has successfully sent an email, we then need to have ESP32 send back
+       // a response with the valid "SHARKWIRE_MAGIC" tag, as well as encoded tag that includes the
+       // EmailID (DEMailID) (for success, and for error) so it will dequeue the emails stored in the
+       // outbox
        const char *email_id_str = EMAIL_ID;
 
        // Build full DEMailID string
        char demailid_buf[256];
        snprintf(demailid_buf, sizeof(demailid_buf), "DEMailID=%s", email_id_str);
 
-       // Get gateway IP for SharkWire encoding
-       const char *ip = ip4addr_ntoa(netif_ip4_gw(&ppp_netif));
-
        // Encode full DEMailID string with SharkWire's encoding
-       char *emailsendok_encoded = sharkwire_encode(demailid_buf, ip);
+       char *emailsendok_encoded = sharkwire_encode(demailid_buf);
 
-       // Now build HTML
+       // This is the HTML that dequeues the outbox and tells sharkwire that the email has
+       // successfully sent
        char *resp = NULL;
 
        asprintf(&resp,
@@ -1286,13 +1510,21 @@ static esp_err_t email_send_post_handler(httpd_req_t *req) {
            "<br clear=all>\n"
            "<input type =\"hidden\" Name=\"DEmailId\" Value=\"%s\">\n"
            "<center><img src=\"file:///c:/dm/shrkimg/all_l_gr_sharkwire.gif\" alt=\"Interact\" width=\"360\" height=\"60\" vspace=\"4\" border=\"0\" align=\"top\">\n"
-           "<p align=\"center\">Your Message was sent successfully!\n"
+           "<p align=\"center\">Your message was sent successfully!\n"
            "</p>\n"
            "</body>\n"
            "</html>\n",
            emailsendok_encoded,   // Encoded DEMailID for meta tag
            emailsendok_encoded    // Encoded DEMailID for hidden form
        );
+
+       if (!resp) {
+           free(emailsendok_encoded);
+           free(fields);
+           free(post_buf);
+           httpd_resp_send(req, "<html><body><center>Error in response</center></body></html>", HTTPD_RESP_USE_STRLEN);
+           return ESP_FAIL;
+       }
 
        httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
        free(emailsendok_encoded);
@@ -1301,15 +1533,8 @@ static esp_err_t email_send_post_handler(httpd_req_t *req) {
 
        return ESP_OK;
 
-       if (!resp) {
-           free(emailsendok_encoded);
-           free(fields);
-           free(post_buf);
-           httpd_resp_send(req, "<html><body><center>Error sending email</center></body></html>", HTTPD_RESP_USE_STRLEN);
-           return ESP_FAIL;
-       }
-
    } else {
+       // At some point this here needs to be filled in to incorporate failure (SHARKWIRE_EMAILSENDFAILURE) tag
        ESP_LOGE(EMAIL_TAG, "Failed to send email");
    }
 
@@ -1319,37 +1544,101 @@ static esp_err_t email_send_post_handler(httpd_req_t *req) {
 }
 
 // email_recv_get_handler
+// This is the handler for the "Email->View Inbox" selection from main menu
 static esp_err_t email_recv_get_handler(httpd_req_t *req) {
-   ESP_LOGI(HTTP_UI_TAG, "Received GET request: URI = %s", req->uri);
+   email_credentials_t email_cfg = {0};
 
-   // Print headers
-   char header_val[100];
-   if (httpd_req_get_hdr_value_str(req, "User-Agent", header_val, sizeof(header_val)) == ESP_OK) {
-       ESP_LOGI(HTTP_UI_TAG, "User-Agent: %s", header_val);
+   if (!load_email_credentials(&email_cfg)) {
+       ESP_LOGE(EMAIL_TAG, "No email credentials saved in NVS");
+       return ESP_FAIL;
    }
 
-   const char *resp_str = "Hello from ESP32 GET!";
-   httpd_resp_send(req, resp_str, HTTPD_RESP_USE_STRLEN);
+   // Null terminate NVS values
+   email_cfg.smtp_server[sizeof(email_cfg.smtp_server) - 1] = '\0';
+   email_cfg.smtp_port[sizeof(email_cfg.smtp_port) - 1] = '\0';
+   email_cfg.imap_server[sizeof(email_cfg.imap_server) - 1] = '\0';
+   email_cfg.imap_port[sizeof(email_cfg.imap_port) - 1] = '\0';
+   email_cfg.username[sizeof(email_cfg.username) - 1] = '\0';
+   email_cfg.password[sizeof(email_cfg.password) - 1] = '\0';
+
+   // Convert SMTP port from string to int
+   int smtp_port_num = atoi(email_cfg.smtp_port);
+   if (smtp_port_num <= 0) smtp_port_num = 465; // fallback SMTP port
+
+   // Convert IMAP port from string to int
+   int imap_port_num = atoi(email_cfg.imap_port);
+   if (imap_port_num <= 0) imap_port_num = 993; // fallback IMAP port
+
+   ESP_LOGI(HTTP_UI_TAG, "URI: %s", req->uri);
+
+   esp_tls_t *tls = esp_tls_init();
+   if (!tls) {
+       ESP_LOGE(EMAIL_TAG, "TLS init failed");
+       return ESP_FAIL;
+   }
+
+   esp_tls_cfg_t cfg = {
+       .crt_bundle_attach = esp_crt_bundle_attach
+   };
+   
+   if (esp_tls_conn_new_sync(email_cfg.imap_server, strlen(email_cfg.imap_server), imap_port_num, &cfg, tls) != 1) {
+       ESP_LOGE(EMAIL_TAG, "TLS connection to IMAP server failed");
+       esp_tls_conn_destroy(tls);
+       return ESP_FAIL;
+   }
+
+   char imap_recv_buf[2048];
+
+   // Wait for server greeting
+   imap_recv(tls, imap_recv_buf, sizeof(imap_recv_buf));
+   ESP_LOGI(EMAIL_TAG, "Server: %s", imap_recv_buf);
+
+   // Login
+   char login_cmd[512];
+   snprintf(login_cmd, sizeof(login_cmd),
+         "a LOGIN \"%s\" \"%s\"\r\n",
+         email_cfg.username, email_cfg.password);
+   imap_send(tls, login_cmd);
+   imap_recv(tls, imap_recv_buf, sizeof(imap_recv_buf));
+   ESP_LOGI(EMAIL_TAG, "Login: %s", imap_recv_buf);
+
+   // Select inbox
+   imap_send(tls, "a SELECT INBOX\r\n");
+   imap_recv(tls, imap_recv_buf, sizeof(imap_recv_buf));
+   ESP_LOGI(EMAIL_TAG, "Select: %s", imap_recv_buf);
+
+   // Fetch first few emails
+   imap_send(tls, "a FETCH 1:5 (BODY[HEADER.FIELDS (FROM SUBJECT DATE)])\r\n");
+   imap_recv(tls, imap_recv_buf, sizeof(imap_recv_buf));
+   ESP_LOGI(EMAIL_TAG, "Emails:\n%s", imap_recv_buf);
+
+   // Send pretty HTML back to browser
+   httpd_resp_set_type(req, "text/html");
+   httpd_resp_send(req, imap_recv_buf, HTTPD_RESP_USE_STRLEN);
+
+   esp_tls_conn_destroy(tls);
    return ESP_OK;
 }
 
 // email_recv_post_handler
+// I don't think we get an email recv post request from anything on the menu (yet)
+// so this is mostly just debug output for now
 static esp_err_t email_recv_post_handler(httpd_req_t *req) {
    ESP_LOGI(HTTP_UI_TAG, "Received POST request: URI = %s", req->uri);
 
    // Read the body
    int total_len = req->content_len;
    int received = 0;
-   char buf[256];
+   char post_buf[256];
 
    while (received < total_len) {
-       int ret = httpd_req_recv(req, buf, MIN(sizeof(buf), total_len - received));
+       int ret = httpd_req_recv(req, post_buf, MIN(sizeof(post_buf), total_len - received));
        if (ret <= 0) {
            ESP_LOGE(HTTP_UI_TAG, "Error receiving body!");
            return ESP_FAIL;
        }
-       buf[ret] = 0; // Null-terminate
-       ESP_LOGI(HTTP_UI_TAG, "POST data: %s", buf);
+       post_buf[ret] = 0; // Null-terminate
+       ESP_LOGI(HTTP_UI_TAG, "POST data: %s", post_buf);
        received += ret;
    }
 
@@ -1371,19 +1660,18 @@ void http_ui_task(void *arg) {
    httpd_handle_t server = NULL;
    httpd_start(&server, &config);
 
+   // We will handle these in the config_post_handler since they're all part of the config page
    httpd_uri_t config_get_uri = {.uri="/", .method=HTTP_GET, .handler=config_get_handler};
    httpd_uri_t config_post_uri = {.uri="/", .method=HTTP_POST, .handler=config_post_handler};
+   httpd_uri_t unbond_ble_device_post_uri = {.uri="/unbond_ble_device", .method=HTTP_POST, .handler=config_post_handler};
+   httpd_uri_t save_wifi_post_uri = {.uri="/save_wifi", .method=HTTP_POST, .handler=config_post_handler};
+   httpd_uri_t save_email_post_uri = {.uri="/save_email", .method=HTTP_POST, .handler=config_post_handler};
 
    httpd_uri_t email_send_get_uri = {.uri="/cgi-bin/netshark/ONetParser", .method=HTTP_GET, .handler=email_send_get_handler};
    httpd_uri_t email_send_post_uri = {.uri="/cgi-bin/netshark/ONetParser", .method=HTTP_POST, .handler=email_send_post_handler};
 
    httpd_uri_t email_recv_get_uri = {.uri="/cgi-bin/netshark/fixer", .method=HTTP_GET, .handler=email_recv_get_handler};
    httpd_uri_t email_recv_post_uri = {.uri="/cgi-bin/netshark/fixer", .method=HTTP_POST, .handler=email_recv_post_handler};
-
-   // We will handle these in the config_post_handler since it's part of the config page
-   httpd_uri_t unbond_ble_device_post_uri = {.uri="/unbond_ble_device", .method=HTTP_POST, .handler=config_post_handler};
-   httpd_uri_t save_wifi_post_uri = {.uri="/save_wifi", .method=HTTP_POST, .handler=config_post_handler};
-   httpd_uri_t save_email_post_uri = {.uri="/save_email", .method=HTTP_POST, .handler=config_post_handler};
 
    httpd_uri_t home_get_uri = {.uri="/swo/shark.home", .method=HTTP_GET, .handler=home_get_handler};
 
@@ -1427,21 +1715,18 @@ void http_ui_task(void *arg) {
        .method = HTTP_GET,
        .handler = ble_status_get_handler,
    };
-   httpd_register_uri_handler(server, &ble_status_uri);
 
    httpd_uri_t menu_uri = {
        .uri = "/swo/menu.htm",
        .method = HTTP_GET,
        .handler = menu_get_handler,
    };
-   httpd_register_uri_handler(server, &menu_uri);
 
    httpd_uri_t content_uri = {
        .uri = "/swo/content.htm",
        .method = HTTP_GET,
        .handler = content_get_handler,
    };
-   httpd_register_uri_handler(server, &content_uri);
 
    httpd_uri_t gamegenie_handler = {
       .uri      = "/cheats/gameshark/n64/*",
@@ -1449,9 +1734,25 @@ void http_ui_task(void *arg) {
       .handler  = gamegenie_proxy_handler,
       .user_ctx = NULL,
    };
-   httpd_register_uri_handler(server, &gamegenie_handler);
 
    // Register URI handlers
+
+   if (httpd_register_uri_handler(server, &ble_status_uri) != ESP_OK) {
+       ESP_LOGE(HTTP_UI_TAG, "Failed to BLE status handler");
+   }
+
+   if (httpd_register_uri_handler(server, &menu_uri) != ESP_OK) {
+       ESP_LOGE(HTTP_UI_TAG, "Failed to register home menu handler");
+   }
+
+   if (httpd_register_uri_handler(server, &content_uri) != ESP_OK) {
+       ESP_LOGE(HTTP_UI_TAG, "Failed to register home content handler");
+   }
+
+   if (httpd_register_uri_handler(server, &gamegenie_handler) != ESP_OK) {
+       ESP_LOGE(HTTP_UI_TAG, "Failed to register gamegenie handler");
+   }
+
    if (httpd_register_uri_handler(server, &save_email_post_uri) != ESP_OK) {
        ESP_LOGE(HTTP_UI_TAG, "Failed to register save_email POST handler");
    }
